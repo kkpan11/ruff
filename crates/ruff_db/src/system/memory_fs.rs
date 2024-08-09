@@ -4,9 +4,13 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use filetime::FileTime;
+use rustc_hash::FxHashMap;
+
+use ruff_notebook::{Notebook, NotebookError};
 
 use crate::system::{
     walk_directory, DirectoryEntry, FileType, Metadata, Result, SystemPath, SystemPathBuf,
+    SystemVirtualPath, SystemVirtualPathBuf,
 };
 
 use super::walk_directory::{
@@ -50,6 +54,7 @@ impl MemoryFileSystem {
         let fs = Self {
             inner: Arc::new(MemoryFileSystemInner {
                 by_path: RwLock::new(BTreeMap::default()),
+                virtual_files: RwLock::new(FxHashMap::default()),
                 cwd: cwd.clone(),
             }),
         };
@@ -61,13 +66,6 @@ impl MemoryFileSystem {
 
     pub fn current_directory(&self) -> &SystemPath {
         &self.inner.cwd
-    }
-
-    #[must_use]
-    pub fn snapshot(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
     }
 
     pub fn metadata(&self, path: impl AsRef<SystemPath>) -> Result<Metadata> {
@@ -94,6 +92,10 @@ impl MemoryFileSystem {
         }
 
         metadata(self, path.as_ref())
+    }
+
+    pub fn canonicalize(&self, path: impl AsRef<SystemPath>) -> SystemPathBuf {
+        SystemPathBuf::from_utf8_path_buf(self.normalize_path(path))
     }
 
     pub fn is_file(&self, path: impl AsRef<SystemPath>) -> bool {
@@ -134,11 +136,52 @@ impl MemoryFileSystem {
         ruff_notebook::Notebook::from_source_code(&content)
     }
 
+    pub(crate) fn virtual_path_metadata(
+        &self,
+        path: impl AsRef<SystemVirtualPath>,
+    ) -> Result<Metadata> {
+        let virtual_files = self.inner.virtual_files.read().unwrap();
+        let file = virtual_files
+            .get(&path.as_ref().to_path_buf())
+            .ok_or_else(not_found)?;
+
+        Ok(Metadata {
+            revision: file.last_modified.into(),
+            permissions: Some(MemoryFileSystem::PERMISSION),
+            file_type: FileType::File,
+        })
+    }
+
+    pub(crate) fn read_virtual_path_to_string(
+        &self,
+        path: impl AsRef<SystemVirtualPath>,
+    ) -> Result<String> {
+        let virtual_files = self.inner.virtual_files.read().unwrap();
+        let file = virtual_files
+            .get(&path.as_ref().to_path_buf())
+            .ok_or_else(not_found)?;
+
+        Ok(file.content.clone())
+    }
+
+    pub(crate) fn read_virtual_path_to_notebook(
+        &self,
+        path: &SystemVirtualPath,
+    ) -> std::result::Result<Notebook, NotebookError> {
+        let content = self.read_virtual_path_to_string(path)?;
+        ruff_notebook::Notebook::from_source_code(&content)
+    }
+
     pub fn exists(&self, path: &SystemPath) -> bool {
         let by_path = self.inner.by_path.read().unwrap();
         let normalized = self.normalize_path(path);
 
         by_path.contains_key(&normalized)
+    }
+
+    pub fn virtual_path_exists(&self, path: &SystemVirtualPath) -> bool {
+        let virtual_files = self.inner.virtual_files.read().unwrap();
+        virtual_files.contains_key(&path.to_path_buf())
     }
 
     /// Writes the files to the file system.
@@ -168,9 +211,31 @@ impl MemoryFileSystem {
 
         let normalized = self.normalize_path(path.as_ref());
 
-        get_or_create_file(&mut by_path, &normalized)?.content = content.to_string();
+        let file = get_or_create_file(&mut by_path, &normalized)?;
+        file.content = content.to_string();
+        file.last_modified = now();
 
         Ok(())
+    }
+
+    /// Stores a new virtual file in the file system.
+    ///
+    /// The operation overrides the content for an existing virtual file with the same `path`.
+    pub fn write_virtual_file(&self, path: impl AsRef<SystemVirtualPath>, content: impl ToString) {
+        let path = path.as_ref();
+        let mut virtual_files = self.inner.virtual_files.write().unwrap();
+
+        match virtual_files.entry(path.to_path_buf()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(File {
+                    content: content.to_string(),
+                    last_modified: now(),
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().content = content.to_string();
+            }
+        }
     }
 
     /// Returns a builder for walking the directory tree of `path`.
@@ -201,6 +266,17 @@ impl MemoryFileSystem {
         remove_file(self, path.as_ref())
     }
 
+    pub fn remove_virtual_file(&self, path: impl AsRef<SystemVirtualPath>) -> Result<()> {
+        let mut virtual_files = self.inner.virtual_files.write().unwrap();
+        match virtual_files.entry(path.as_ref().to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                entry.remove();
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Vacant(_) => Err(not_found()),
+        }
+    }
+
     /// Sets the last modified timestamp of the file stored at `path` to now.
     ///
     /// Creates a new file if the file at `path` doesn't exist.
@@ -208,7 +284,7 @@ impl MemoryFileSystem {
         let mut by_path = self.inner.by_path.write().unwrap();
         let normalized = self.normalize_path(path.as_ref());
 
-        get_or_create_file(&mut by_path, &normalized)?.last_modified = FileTime::now();
+        get_or_create_file(&mut by_path, &normalized)?.last_modified = now();
 
         Ok(())
     }
@@ -309,6 +385,7 @@ impl std::fmt::Debug for MemoryFileSystem {
 
 struct MemoryFileSystemInner {
     by_path: RwLock<BTreeMap<Utf8PathBuf, Entry>>,
+    virtual_files: RwLock<FxHashMap<SystemVirtualPathBuf, File>>,
     cwd: SystemPathBuf,
 }
 
@@ -372,7 +449,7 @@ fn create_dir_all(
         path.push(component);
         let entry = paths.entry(path.clone()).or_insert_with(|| {
             Entry::Directory(Directory {
-                last_modified: FileTime::now(),
+                last_modified: now(),
             })
         });
 
@@ -395,7 +472,7 @@ fn get_or_create_file<'a>(
     let entry = paths.entry(normalized.to_path_buf()).or_insert_with(|| {
         Entry::File(File {
             content: String::new(),
-            last_modified: FileTime::now(),
+            last_modified: now(),
         })
     });
 
@@ -577,6 +654,30 @@ enum WalkerState {
     Nested { path: SystemPathBuf, depth: usize },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn now() -> FileTime {
+    FileTime::now()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now() -> FileTime {
+    // Copied from FileTime::from_system_time()
+    let time = web_time::SystemTime::now();
+
+    time.duration_since(web_time::UNIX_EPOCH)
+        .map(|d| FileTime::from_unix_time(d.as_secs() as i64, d.subsec_nanos()))
+        .unwrap_or_else(|e| {
+            let until_epoch = e.duration();
+            let (sec_offset, nanos) = if until_epoch.subsec_nanos() == 0 {
+                (0, 0)
+            } else {
+                (-1, 1_000_000_000 - until_epoch.subsec_nanos())
+            };
+
+            FileTime::from_unix_time(-(until_epoch.as_secs() as i64) + sec_offset, nanos)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::ErrorKind;
@@ -586,6 +687,7 @@ mod tests {
     use crate::system::walk_directory::WalkState;
     use crate::system::{
         DirectoryEntry, FileType, MemoryFileSystem, Result, SystemPath, SystemPathBuf,
+        SystemVirtualPath,
     };
 
     /// Creates a file system with the given files.
@@ -725,6 +827,18 @@ mod tests {
     }
 
     #[test]
+    fn write_virtual_file() {
+        let fs = MemoryFileSystem::new();
+
+        fs.write_virtual_file("a", "content");
+
+        let error = fs.read_to_string("a").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+
+        assert_eq!(fs.read_virtual_path_to_string("a").unwrap(), "content");
+    }
+
+    #[test]
     fn read() -> Result<()> {
         let fs = MemoryFileSystem::new();
         let path = SystemPath::new("a.py");
@@ -761,6 +875,15 @@ mod tests {
     }
 
     #[test]
+    fn read_fails_if_virtual_path_doesnt_exit() {
+        let fs = MemoryFileSystem::new();
+
+        let error = fs.read_virtual_path_to_string("a").unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
     fn remove_file() -> Result<()> {
         let fs = with_files(["a/a.py", "b.py"]);
 
@@ -775,6 +898,18 @@ mod tests {
         assert!(fs.exists(SystemPath::new("b.py")));
 
         Ok(())
+    }
+
+    #[test]
+    fn remove_virtual_file() {
+        let fs = MemoryFileSystem::new();
+        fs.write_virtual_file("a", "content");
+        fs.write_virtual_file("b", "content");
+
+        fs.remove_virtual_file("a").unwrap();
+
+        assert!(!fs.virtual_path_exists(SystemVirtualPath::new("a")));
+        assert!(fs.virtual_path_exists(SystemVirtualPath::new("b")));
     }
 
     #[test]

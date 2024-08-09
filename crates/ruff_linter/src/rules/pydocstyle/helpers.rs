@@ -1,9 +1,11 @@
-use std::collections::BTreeSet;
-
 use ruff_python_ast::helpers::map_callable;
-use ruff_python_ast::name::QualifiedName;
 use ruff_python_semantic::{Definition, SemanticModel};
 use ruff_source_file::UniversalNewlines;
+
+use crate::docstrings::sections::{SectionContexts, SectionKind};
+use crate::docstrings::styles::SectionStyle;
+use crate::docstrings::Docstring;
+use crate::rules::pydocstyle::settings::{Convention, Settings};
 
 /// Return the index of the first logical line in a string.
 pub(super) fn logical_line(content: &str) -> Option<usize> {
@@ -40,10 +42,12 @@ pub(super) fn ends_with_backslash(line: &str) -> bool {
 /// Check decorator list to see if function should be ignored.
 pub(crate) fn should_ignore_definition(
     definition: &Definition,
-    ignore_decorators: &BTreeSet<String>,
+    settings: &Settings,
     semantic: &SemanticModel,
 ) -> bool {
-    if ignore_decorators.is_empty() {
+    let ignore_decorators = settings.ignore_decorators();
+
+    if ignore_decorators.len() == 0 {
         return false;
     }
 
@@ -56,8 +60,64 @@ pub(crate) fn should_ignore_definition(
             .resolve_qualified_name(map_callable(&decorator.expression))
             .is_some_and(|qualified_name| {
                 ignore_decorators
-                    .iter()
-                    .any(|decorator| QualifiedName::from_dotted_name(decorator) == qualified_name)
+                    .clone()
+                    .any(|decorator| decorator == qualified_name)
             })
     })
+}
+
+pub(crate) fn get_section_contexts<'a>(
+    docstring: &'a Docstring<'a>,
+    convention: Option<Convention>,
+) -> SectionContexts<'a> {
+    match convention {
+        Some(Convention::Google) => {
+            return SectionContexts::from_docstring(docstring, SectionStyle::Google);
+        }
+        Some(Convention::Numpy) => {
+            return SectionContexts::from_docstring(docstring, SectionStyle::Numpy);
+        }
+        Some(Convention::Pep257) | None => {
+            // There are some overlapping section names, between the Google and NumPy conventions
+            // (e.g., "Returns", "Raises"). Break ties by checking for the presence of some of the
+            // section names that are unique to each convention.
+
+            // If the docstring contains `Parameters:` or `Other Parameters:`, use the NumPy
+            // convention.
+            let numpy_sections = SectionContexts::from_docstring(docstring, SectionStyle::Numpy);
+            if numpy_sections.iter().any(|context| {
+                matches!(
+                    context.kind(),
+                    SectionKind::Parameters
+                        | SectionKind::OtherParams
+                        | SectionKind::OtherParameters
+                )
+            }) {
+                return numpy_sections;
+            }
+
+            // If the docstring contains any argument specifier, use the Google convention.
+            let google_sections = SectionContexts::from_docstring(docstring, SectionStyle::Google);
+            if google_sections.iter().any(|context| {
+                matches!(
+                    context.kind(),
+                    SectionKind::Args
+                        | SectionKind::Arguments
+                        | SectionKind::KeywordArgs
+                        | SectionKind::KeywordArguments
+                        | SectionKind::OtherArgs
+                        | SectionKind::OtherArguments
+                )
+            }) {
+                return google_sections;
+            }
+
+            // Otherwise, use whichever convention matched more sections.
+            if google_sections.len() > numpy_sections.len() {
+                google_sections
+            } else {
+                numpy_sections
+            }
+        }
+    }
 }

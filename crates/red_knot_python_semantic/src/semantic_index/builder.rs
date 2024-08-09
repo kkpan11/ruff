@@ -31,8 +31,10 @@ pub(super) struct SemanticIndexBuilder<'db> {
     file: File,
     module: &'db ParsedModule,
     scope_stack: Vec<FileScopeId>,
-    /// the assignment we're currently visiting
+    /// The assignment we're currently visiting.
     current_assignment: Option<CurrentAssignment<'db>>,
+    /// Flow states at each `break` in the current loop.
+    loop_break_states: Vec<FlowSnapshot>,
 
     // Semantic Index fields
     scopes: IndexVec<FileScopeId, Scope>,
@@ -54,6 +56,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             module: parsed,
             scope_stack: Vec::new(),
             current_assignment: None,
+            loop_break_states: vec![],
 
             scopes: IndexVec::new(),
             symbol_tables: IndexVec::new(),
@@ -100,9 +103,13 @@ impl<'db> SemanticIndexBuilder<'db> {
 
         #[allow(unsafe_code)]
         // SAFETY: `node` is guaranteed to be a child of `self.module`
-        let scope_id = ScopeId::new(self.db, self.file, file_scope_id, unsafe {
-            node.to_kind(self.module.clone())
-        });
+        let scope_id = ScopeId::new(
+            self.db,
+            self.file,
+            file_scope_id,
+            unsafe { node.to_kind(self.module.clone()) },
+            countme::Count::default(),
+        );
 
         self.scope_ids_by_scope.push(scope_id);
         self.scopes_by_node.insert(node.node_key(), file_scope_id);
@@ -125,9 +132,14 @@ impl<'db> SemanticIndexBuilder<'db> {
         &mut self.symbol_tables[scope_id]
     }
 
-    fn current_use_def_map(&mut self) -> &mut UseDefMapBuilder<'db> {
+    fn current_use_def_map_mut(&mut self) -> &mut UseDefMapBuilder<'db> {
         let scope_id = self.current_scope();
         &mut self.use_def_maps[scope_id]
+    }
+
+    fn current_use_def_map(&self) -> &UseDefMapBuilder<'db> {
+        let scope_id = self.current_scope();
+        &self.use_def_maps[scope_id]
     }
 
     fn current_ast_ids(&mut self) -> &mut AstIdsBuilder {
@@ -135,23 +147,23 @@ impl<'db> SemanticIndexBuilder<'db> {
         &mut self.ast_ids[scope_id]
     }
 
-    fn flow_snapshot(&mut self) -> FlowSnapshot {
+    fn flow_snapshot(&self) -> FlowSnapshot {
         self.current_use_def_map().snapshot()
     }
 
     fn flow_restore(&mut self, state: FlowSnapshot) {
-        self.current_use_def_map().restore(state);
+        self.current_use_def_map_mut().restore(state);
     }
 
     fn flow_merge(&mut self, state: &FlowSnapshot) {
-        self.current_use_def_map().merge(state);
+        self.current_use_def_map_mut().merge(state);
     }
 
     fn add_or_update_symbol(&mut self, name: Name, flags: SymbolFlags) -> ScopedSymbolId {
         let symbol_table = self.current_symbol_table();
         let (symbol_id, added) = symbol_table.add_or_update_symbol(name, flags);
         if added {
-            let use_def_map = self.current_use_def_map();
+            let use_def_map = self.current_use_def_map_mut();
             use_def_map.add_symbol(symbol_id);
         }
         symbol_id
@@ -172,11 +184,12 @@ impl<'db> SemanticIndexBuilder<'db> {
             unsafe {
                 definition_node.into_owned(self.module.clone())
             },
+            countme::Count::default(),
         );
 
         self.definitions_by_node
             .insert(definition_node.key(), definition);
-        self.current_use_def_map()
+        self.current_use_def_map_mut()
             .record_definition(symbol, definition);
 
         definition
@@ -193,6 +206,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             unsafe {
                 AstNodeRef::new(self.module.clone(), expression_node)
             },
+            countme::Count::default(),
         );
         self.expressions_by_node
             .insert(expression_node.into(), expression);
@@ -200,30 +214,38 @@ impl<'db> SemanticIndexBuilder<'db> {
 
     fn with_type_params(
         &mut self,
-        with_params: &WithTypeParams,
+        with_scope: NodeWithScopeRef,
+        type_params: Option<&'db ast::TypeParams>,
         nested: impl FnOnce(&mut Self) -> FileScopeId,
     ) -> FileScopeId {
-        let type_params = with_params.type_parameters();
-
         if let Some(type_params) = type_params {
-            let with_scope = match with_params {
-                WithTypeParams::ClassDef { node, .. } => {
-                    NodeWithScopeRef::ClassTypeParameters(node)
-                }
-                WithTypeParams::FunctionDef { node, .. } => {
-                    NodeWithScopeRef::FunctionTypeParameters(node)
-                }
-            };
-
             self.push_scope(with_scope);
 
             for type_param in &type_params.type_params {
-                let name = match type_param {
-                    ast::TypeParam::TypeVar(ast::TypeParamTypeVar { name, .. }) => name,
-                    ast::TypeParam::ParamSpec(ast::TypeParamParamSpec { name, .. }) => name,
-                    ast::TypeParam::TypeVarTuple(ast::TypeParamTypeVarTuple { name, .. }) => name,
+                let (name, bound, default) = match type_param {
+                    ast::TypeParam::TypeVar(ast::TypeParamTypeVar {
+                        range: _,
+                        name,
+                        bound,
+                        default,
+                    }) => (name, bound, default),
+                    ast::TypeParam::ParamSpec(ast::TypeParamParamSpec {
+                        name, default, ..
+                    }) => (name, &None, default),
+                    ast::TypeParam::TypeVarTuple(ast::TypeParamTypeVarTuple {
+                        name,
+                        default,
+                        ..
+                    }) => (name, &None, default),
                 };
+                // TODO create Definition for typevars
                 self.add_or_update_symbol(name.id.clone(), SymbolFlags::IS_DEFINED);
+                if let Some(bound) = bound {
+                    self.visit_expr(bound);
+                }
+                if let Some(default) = default {
+                    self.visit_expr(default);
+                }
             }
         }
 
@@ -304,10 +326,11 @@ where
                 self.add_definition(symbol, function_def);
 
                 self.with_type_params(
-                    &WithTypeParams::FunctionDef { node: function_def },
+                    NodeWithScopeRef::FunctionTypeParameters(function_def),
+                    function_def.type_params.as_deref(),
                     |builder| {
                         builder.visit_parameters(&function_def.parameters);
-                        for expr in &function_def.returns {
+                        if let Some(expr) = &function_def.returns {
                             builder.visit_annotation(expr);
                         }
 
@@ -326,16 +349,20 @@ where
                     self.add_or_update_symbol(class.name.id.clone(), SymbolFlags::IS_DEFINED);
                 self.add_definition(symbol, class);
 
-                self.with_type_params(&WithTypeParams::ClassDef { node: class }, |builder| {
-                    if let Some(arguments) = &class.arguments {
-                        builder.visit_arguments(arguments);
-                    }
+                self.with_type_params(
+                    NodeWithScopeRef::ClassTypeParameters(class),
+                    class.type_params.as_deref(),
+                    |builder| {
+                        if let Some(arguments) = &class.arguments {
+                            builder.visit_arguments(arguments);
+                        }
 
-                    builder.push_scope(NodeWithScopeRef::Class(class));
-                    builder.visit_body(&class.body);
+                        builder.push_scope(NodeWithScopeRef::Class(class));
+                        builder.visit_body(&class.body);
 
-                    builder.pop_scope()
-                });
+                        builder.pop_scope()
+                    },
+                );
             }
             ast::Stmt::Import(node) => {
                 for alias in &node.names {
@@ -376,18 +403,12 @@ where
                 debug_assert!(self.current_assignment.is_none());
                 // TODO deferred annotation visiting
                 self.visit_expr(&node.annotation);
-                match &node.value {
-                    Some(value) => {
-                        self.visit_expr(value);
-                        self.current_assignment = Some(node.into());
-                        self.visit_expr(&node.target);
-                        self.current_assignment = None;
-                    }
-                    None => {
-                        // TODO annotation-only assignments
-                        self.visit_expr(&node.target);
-                    }
+                if let Some(value) = &node.value {
+                    self.visit_expr(value);
                 }
+                self.current_assignment = Some(node.into());
+                self.visit_expr(&node.target);
+                self.current_assignment = None;
             }
             ast::Stmt::If(node) => {
                 self.visit_expr(&node.test);
@@ -415,6 +436,33 @@ where
                     // and the pre_if state can reach here
                     self.flow_merge(&pre_if);
                 }
+            }
+            ast::Stmt::While(node) => {
+                self.visit_expr(&node.test);
+
+                let pre_loop = self.flow_snapshot();
+
+                // Save aside any break states from an outer loop
+                let saved_break_states = std::mem::take(&mut self.loop_break_states);
+                self.visit_body(&node.body);
+                // Get the break states from the body of this loop, and restore the saved outer
+                // ones.
+                let break_states =
+                    std::mem::replace(&mut self.loop_break_states, saved_break_states);
+
+                // We may execute the `else` clause without ever executing the body, so merge in
+                // the pre-loop state before visiting `else`.
+                self.flow_merge(&pre_loop);
+                self.visit_body(&node.orelse);
+
+                // Breaking out of a while loop bypasses the `else` clause, so merge in the break
+                // states after visiting `else`.
+                for break_state in break_states {
+                    self.flow_merge(&break_state);
+                }
+            }
+            ast::Stmt::Break(_) => {
+                self.loop_break_states.push(self.flow_snapshot());
             }
             _ => {
                 walk_stmt(self, stmt);
@@ -460,7 +508,7 @@ where
 
                 if flags.contains(SymbolFlags::IS_USED) {
                     let use_id = self.current_ast_ids().record_use(expr);
-                    self.current_use_def_map().record_use(symbol, use_id);
+                    self.current_use_def_map_mut().record_use(symbol, use_id);
                 }
 
                 walk_expr(self, expr);
@@ -472,6 +520,14 @@ where
                 self.visit_expr(&node.target);
                 self.current_assignment = None;
                 self.visit_expr(&node.value);
+            }
+            ast::Expr::Lambda(lambda) => {
+                if let Some(parameters) = &lambda.parameters {
+                    self.visit_parameters(parameters);
+                }
+                self.push_scope(NodeWithScopeRef::Lambda(lambda));
+                self.visit_expr(lambda.body.as_ref());
+                self.pop_scope();
             }
             ast::Expr::If(ast::ExprIf {
                 body, test, orelse, ..
@@ -490,20 +546,6 @@ where
             _ => {
                 walk_expr(self, expr);
             }
-        }
-    }
-}
-
-enum WithTypeParams<'node> {
-    ClassDef { node: &'node ast::StmtClassDef },
-    FunctionDef { node: &'node ast::StmtFunctionDef },
-}
-
-impl<'node> WithTypeParams<'node> {
-    fn type_parameters(&self) -> Option<&'node ast::TypeParams> {
-        match self {
-            WithTypeParams::ClassDef { node, .. } => node.type_params.as_deref(),
-            WithTypeParams::FunctionDef { node, .. } => node.type_params.as_deref(),
         }
     }
 }

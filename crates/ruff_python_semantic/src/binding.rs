@@ -5,8 +5,9 @@ use bitflags::bitflags;
 
 use crate::all::DunderAllName;
 use ruff_index::{newtype_index, IndexSlice, IndexVec};
+use ruff_python_ast::helpers::extract_handled_exceptions;
 use ruff_python_ast::name::QualifiedName;
-use ruff_python_ast::Stmt;
+use ruff_python_ast::{self as ast, Stmt};
 use ruff_source_file::Locator;
 use ruff_text_size::{Ranged, TextRange};
 
@@ -35,9 +36,18 @@ pub struct Binding<'a> {
 }
 
 impl<'a> Binding<'a> {
+    /// Return `true` if this [`Binding`] is unused.
+    ///
+    /// This method is the opposite of [`Binding::is_used`].
+    pub fn is_unused(&self) -> bool {
+        self.references.is_empty()
+    }
+
     /// Return `true` if this [`Binding`] is used.
+    ///
+    /// This method is the opposite of [`Binding::is_unused`].
     pub fn is_used(&self) -> bool {
-        !self.references.is_empty()
+        !self.is_unused()
     }
 
     /// Returns an iterator over all references for the current [`Binding`].
@@ -112,6 +122,18 @@ impl<'a> Binding<'a> {
     /// (e.g., `_x` in `_x = "private variable"`)
     pub const fn is_private_declaration(&self) -> bool {
         self.flags.contains(BindingFlags::PRIVATE_DECLARATION)
+    }
+
+    /// Return `true` if this [`Binding`] took place inside an exception handler,
+    /// e.g. `y` in:
+    /// ```python
+    /// try:
+    ///      x = 42
+    /// except RuntimeError:
+    ///      y = 42
+    /// ```
+    pub const fn in_exception_handler(&self) -> bool {
+        self.flags.contains(BindingFlags::IN_EXCEPT_HANDLER)
     }
 
     /// Return `true` if this binding "redefines" the given binding, as per Pyflake's definition of
@@ -333,6 +355,18 @@ bitflags! {
         /// (x, y) = 1, 2
         /// ```
         const UNPACKED_ASSIGNMENT = 1 << 9;
+
+        /// The binding took place inside an exception handling.
+        ///
+        /// For example, the `x` binding in the following example
+        /// would *not* have this flag set, but the `y` binding *would*:
+        /// ```python
+        /// try:
+        ///     x = 42
+        /// except RuntimeError:
+        ///     y = 42
+        /// ```
+        const IN_EXCEPT_HANDLER = 1 << 10;
     }
 }
 
@@ -579,6 +613,26 @@ bitflags! {
         const NAME_ERROR = 0b0000_0001;
         const MODULE_NOT_FOUND_ERROR = 0b0000_0010;
         const IMPORT_ERROR = 0b0000_0100;
+        const ATTRIBUTE_ERROR = 0b000_100;
+    }
+}
+
+impl Exceptions {
+    pub fn from_try_stmt(
+        ast::StmtTry { handlers, .. }: &ast::StmtTry,
+        semantic: &SemanticModel,
+    ) -> Self {
+        let mut handled_exceptions = Self::empty();
+        for type_ in extract_handled_exceptions(handlers) {
+            handled_exceptions |= match semantic.resolve_builtin_symbol(type_) {
+                Some("NameError") => Self::NAME_ERROR,
+                Some("ModuleNotFoundError") => Self::MODULE_NOT_FOUND_ERROR,
+                Some("ImportError") => Self::IMPORT_ERROR,
+                Some("AttributeError") => Self::ATTRIBUTE_ERROR,
+                _ => continue,
+            }
+        }
+        handled_exceptions
     }
 }
 

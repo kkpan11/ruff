@@ -1,35 +1,39 @@
+use std::process::{ExitCode, Termination};
 use std::sync::Mutex;
 
+use anyhow::{anyhow, Context};
 use clap::Parser;
+use colored::Colorize;
 use crossbeam::channel as crossbeam_channel;
-use salsa::ParallelDatabase;
-use tracing::subscriber::Interest;
-use tracing::{Level, Metadata};
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::layer::{Context, Filter, SubscriberExt};
-use tracing_subscriber::{Layer, Registry};
-use tracing_tree::time::Uptime;
+use salsa::plumbing::ZalsaDatabase;
 
-use red_knot::db::RootDatabase;
-use red_knot::watch::FileWatcher;
-use red_knot::watch::FileWatcherChange;
-use red_knot::workspace::WorkspaceMetadata;
-use ruff_db::program::{ProgramSettings, SearchPathSettings};
-use ruff_db::system::{OsSystem, System, SystemPathBuf};
+use red_knot_python_semantic::{ProgramSettings, SearchPathSettings};
+use red_knot_server::run_server;
+use red_knot_workspace::db::RootDatabase;
+use red_knot_workspace::site_packages::site_packages_dirs_of_venv;
+use red_knot_workspace::watch;
+use red_knot_workspace::watch::WorkspaceWatcher;
+use red_knot_workspace::workspace::WorkspaceMetadata;
+use ruff_db::system::{OsSystem, System, SystemPath, SystemPathBuf};
+use target_version::TargetVersion;
 
-use cli::target_version::TargetVersion;
-use cli::verbosity::{Verbosity, VerbosityLevel};
+use crate::logging::{setup_tracing, Verbosity};
 
-mod cli;
+mod logging;
+mod target_version;
+mod verbosity;
 
 #[derive(Debug, Parser)]
 #[command(
     author,
     name = "red-knot",
-    about = "An experimental multifile analysis backend for Ruff"
+    about = "An extremely fast Python type checker."
 )]
 #[command(version)]
 struct Args {
+    #[command(subcommand)]
+    pub(crate) command: Option<Command>,
+
     #[arg(
         long,
         help = "Changes the current working directory.",
@@ -37,6 +41,17 @@ struct Args {
         value_name = "PATH"
     )]
     current_directory: Option<SystemPathBuf>,
+
+    #[arg(
+        long,
+        help = "Path to the virtual environment the project uses",
+        long_help = "\
+Path to the virtual environment the project uses. \
+If provided, red-knot will use the `site-packages` directory of this virtual environment \
+to resolve type information for the project's third-party dependencies.",
+        value_name = "PATH"
+    )]
+    venv_path: Option<SystemPathBuf>,
 
     #[arg(
         long,
@@ -52,52 +67,125 @@ struct Args {
     )]
     extra_search_path: Vec<SystemPathBuf>,
 
-    #[arg(long, help = "Python version to assume when resolving types", default_value_t = TargetVersion::default(), value_name="VERSION")]
+    #[arg(
+        long,
+        help = "Python version to assume when resolving types",
+        default_value_t = TargetVersion::default(),
+        value_name="VERSION")
+    ]
     target_version: TargetVersion,
 
     #[clap(flatten)]
     verbosity: Verbosity,
+
+    #[arg(
+        long,
+        help = "Run in watch mode by re-running whenever files change",
+        short = 'W'
+    )]
+    watch: bool,
 }
 
-#[allow(
-    clippy::print_stdout,
-    clippy::unnecessary_wraps,
-    clippy::print_stderr,
-    clippy::dbg_macro
-)]
-pub fn main() -> anyhow::Result<()> {
+#[derive(Debug, clap::Subcommand)]
+pub enum Command {
+    /// Start the language server
+    Server,
+}
+
+#[allow(clippy::print_stdout, clippy::unnecessary_wraps, clippy::print_stderr)]
+pub fn main() -> ExitStatus {
+    run().unwrap_or_else(|error| {
+        use std::io::Write;
+
+        // Use `writeln` instead of `eprintln` to avoid panicking when the stderr pipe is broken.
+        let mut stderr = std::io::stderr().lock();
+
+        // This communicates that this isn't a linter error but Red Knot itself hard-errored for
+        // some reason (e.g. failed to resolve the configuration)
+        writeln!(stderr, "{}", "Red Knot failed".red().bold()).ok();
+        // Currently we generally only see one error, but e.g. with io errors when resolving
+        // the configuration it is help to chain errors ("resolving configuration failed" ->
+        // "failed to read file: subdir/pyproject.toml")
+        for cause in error.chain() {
+            writeln!(stderr, "  {} {cause}", "Cause:".bold()).ok();
+        }
+
+        ExitStatus::Error
+    })
+}
+
+fn run() -> anyhow::Result<ExitStatus> {
     let Args {
+        command,
         current_directory,
         custom_typeshed_dir,
         extra_search_path: extra_paths,
+        venv_path,
         target_version,
         verbosity,
+        watch,
     } = Args::parse_from(std::env::args().collect::<Vec<_>>());
 
-    let verbosity = verbosity.level();
-    countme::enable(verbosity == Some(VerbosityLevel::Trace));
-    setup_tracing(verbosity);
+    if matches!(command, Some(Command::Server)) {
+        return run_server().map(|()| ExitStatus::Success);
+    }
 
-    let cwd = if let Some(cwd) = current_directory {
-        let canonicalized = cwd.as_utf8_path().canonicalize_utf8().unwrap();
-        SystemPathBuf::from_utf8_path_buf(canonicalized)
-    } else {
-        let cwd = std::env::current_dir().unwrap();
-        SystemPathBuf::from_path_buf(cwd).unwrap()
+    let verbosity = verbosity.level();
+    countme::enable(verbosity.is_trace());
+    let _guard = setup_tracing(verbosity)?;
+
+    // The base path to which all CLI arguments are relative to.
+    let cli_base_path = {
+        let cwd = std::env::current_dir().context("Failed to get the current working directory")?;
+        SystemPathBuf::from_path_buf(cwd)
+            .map_err(|path| {
+                anyhow!(
+                    "The current working directory '{}' contains non-unicode characters. Red Knot only supports unicode paths.",
+                    path.display()
+                )
+            })?
     };
 
+    let cwd = current_directory
+        .map(|cwd| {
+            if cwd.as_std_path().is_dir() {
+                Ok(SystemPath::absolute(&cwd, &cli_base_path))
+            } else {
+                Err(anyhow!(
+                    "Provided current-directory path '{cwd}' is not a directory."
+                ))
+            }
+        })
+        .transpose()?
+        .unwrap_or_else(|| cli_base_path.clone());
+
     let system = OsSystem::new(cwd.clone());
-    let workspace_metadata =
-        WorkspaceMetadata::from_path(system.current_directory(), &system).unwrap();
+    let workspace_metadata = WorkspaceMetadata::from_path(system.current_directory(), &system)?;
+
+    // TODO: Verify the remaining search path settings eagerly.
+    let site_packages = venv_path
+        .map(|venv_path| {
+            let venv_path = SystemPath::absolute(venv_path, &cli_base_path);
+
+            if system.is_directory(&venv_path) {
+                Ok(site_packages_dirs_of_venv(&venv_path, &system)?)
+            } else {
+                Err(anyhow!(
+                    "Provided venv-path {venv_path} is not a directory!"
+                ))
+            }
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     // TODO: Respect the settings from the workspace metadata. when resolving the program settings.
     let program_settings = ProgramSettings {
         target_version: target_version.into(),
         search_paths: SearchPathSettings {
             extra_paths,
-            workspace_root: workspace_metadata.root().to_path_buf(),
+            src_root: workspace_metadata.root().to_path_buf(),
             custom_typeshed: custom_typeshed_dir,
-            site_packages: None,
+            site_packages,
         },
     };
 
@@ -105,7 +193,7 @@ pub fn main() -> anyhow::Result<()> {
     //   cache and load the cache if it exists.
     let mut db = RootDatabase::new(workspace_metadata, program_settings, system);
 
-    let (main_loop, main_loop_cancellation_token) = MainLoop::new(verbosity);
+    let (main_loop, main_loop_cancellation_token) = MainLoop::new();
 
     // Listen to Ctrl+C and abort the watch mode.
     let main_loop_cancellation_token = Mutex::new(Some(main_loop_cancellation_token));
@@ -117,125 +205,158 @@ pub fn main() -> anyhow::Result<()> {
         }
     })?;
 
-    let file_changes_notifier = main_loop.file_changes_notifier();
+    let exit_status = if watch {
+        main_loop.watch(&mut db)?
+    } else {
+        main_loop.run(&mut db)
+    };
 
-    // Watch for file changes and re-trigger the analysis.
-    let mut file_watcher = FileWatcher::new(move |changes| {
-        file_changes_notifier.notify(changes);
-    })?;
+    tracing::trace!("Counts for entire CLI run:\n{}", countme::get_all());
 
-    file_watcher.watch_folder(db.workspace().root(&db).as_std_path())?;
+    std::mem::forget(db);
 
-    main_loop.run(&mut db);
+    Ok(exit_status)
+}
 
-    println!("{}", countme::get_all());
+#[derive(Copy, Clone)]
+pub enum ExitStatus {
+    /// Checking was successful and there were no errors.
+    Success = 0,
 
-    Ok(())
+    /// Checking was successful but there were errors.
+    Failure = 1,
+
+    /// Checking failed.
+    Error = 2,
+}
+
+impl Termination for ExitStatus {
+    fn report(self) -> ExitCode {
+        ExitCode::from(self as u8)
+    }
 }
 
 struct MainLoop {
-    verbosity: Option<VerbosityLevel>,
-    orchestrator: crossbeam_channel::Sender<OrchestratorMessage>,
+    /// Sender that can be used to send messages to the main loop.
+    sender: crossbeam_channel::Sender<MainLoopMessage>,
+
+    /// Receiver for the messages sent **to** the main loop.
     receiver: crossbeam_channel::Receiver<MainLoopMessage>,
+
+    /// The file system watcher, if running in watch mode.
+    watcher: Option<WorkspaceWatcher>,
 }
 
 impl MainLoop {
-    fn new(verbosity: Option<VerbosityLevel>) -> (Self, MainLoopCancellationToken) {
-        let (orchestrator_sender, orchestrator_receiver) = crossbeam_channel::bounded(1);
-        let (main_loop_sender, main_loop_receiver) = crossbeam_channel::bounded(1);
-
-        let mut orchestrator = Orchestrator {
-            receiver: orchestrator_receiver,
-            main_loop: main_loop_sender.clone(),
-            revision: 0,
-        };
-
-        std::thread::spawn(move || {
-            orchestrator.run();
-        });
+    fn new() -> (Self, MainLoopCancellationToken) {
+        let (sender, receiver) = crossbeam_channel::bounded(10);
 
         (
             Self {
-                verbosity,
-                orchestrator: orchestrator_sender,
-                receiver: main_loop_receiver,
+                sender: sender.clone(),
+                receiver,
+                watcher: None,
             },
-            MainLoopCancellationToken {
-                sender: main_loop_sender,
-            },
+            MainLoopCancellationToken { sender },
         )
     }
 
-    fn file_changes_notifier(&self) -> FileChangesNotifier {
-        FileChangesNotifier {
-            sender: self.orchestrator.clone(),
-        }
+    fn watch(mut self, db: &mut RootDatabase) -> anyhow::Result<ExitStatus> {
+        tracing::debug!("Starting watch mode");
+        let sender = self.sender.clone();
+        let watcher = watch::directory_watcher(move |event| {
+            sender.send(MainLoopMessage::ApplyChanges(event)).unwrap();
+        })?;
+
+        self.watcher = Some(WorkspaceWatcher::new(watcher, db));
+
+        self.run(db);
+
+        Ok(ExitStatus::Success)
     }
 
-    #[allow(clippy::print_stderr)]
-    fn run(self, db: &mut RootDatabase) {
-        self.orchestrator.send(OrchestratorMessage::Run).unwrap();
+    fn run(mut self, db: &mut RootDatabase) -> ExitStatus {
+        self.sender.send(MainLoopMessage::CheckWorkspace).unwrap();
 
-        for message in &self.receiver {
-            tracing::trace!("Main Loop: Tick");
+        let result = self.main_loop(db);
 
+        tracing::debug!("Exiting main loop");
+
+        result
+    }
+
+    fn main_loop(&mut self, db: &mut RootDatabase) -> ExitStatus {
+        // Schedule the first check.
+        tracing::debug!("Starting main loop");
+
+        let mut revision = 0u64;
+
+        while let Ok(message) = self.receiver.recv() {
             match message {
-                MainLoopMessage::CheckWorkspace { revision } => {
+                MainLoopMessage::CheckWorkspace => {
                     let db = db.snapshot();
-                    let orchestrator = self.orchestrator.clone();
+                    let sender = self.sender.clone();
 
                     // Spawn a new task that checks the workspace. This needs to be done in a separate thread
                     // to prevent blocking the main loop here.
                     rayon::spawn(move || {
                         if let Ok(result) = db.check() {
-                            orchestrator
-                                .send(OrchestratorMessage::CheckCompleted {
-                                    diagnostics: result,
-                                    revision,
-                                })
+                            // Send the result back to the main loop for printing.
+                            sender
+                                .send(MainLoopMessage::CheckCompleted { result, revision })
                                 .unwrap();
                         }
                     });
                 }
+
+                MainLoopMessage::CheckCompleted {
+                    result,
+                    revision: check_revision,
+                } => {
+                    let has_diagnostics = !result.is_empty();
+                    if check_revision == revision {
+                        for diagnostic in result {
+                            tracing::error!("{}", diagnostic);
+                        }
+                    } else {
+                        tracing::debug!(
+                            "Discarding check result for outdated revision: current: {revision}, result revision: {check_revision}"
+                        );
+                    }
+
+                    if self.watcher.is_none() {
+                        return if has_diagnostics {
+                            ExitStatus::Failure
+                        } else {
+                            ExitStatus::Success
+                        };
+                    }
+
+                    tracing::trace!("Counts after last check:\n{}", countme::get_all());
+                }
+
                 MainLoopMessage::ApplyChanges(changes) => {
+                    revision += 1;
                     // Automatically cancels any pending queries and waits for them to complete.
                     db.apply_changes(changes);
-                }
-                MainLoopMessage::CheckCompleted(diagnostics) => {
-                    eprintln!("{}", diagnostics.join("\n"));
-                    if self.verbosity == Some(VerbosityLevel::Trace) {
-                        eprintln!("{}", countme::get_all());
+                    if let Some(watcher) = self.watcher.as_mut() {
+                        watcher.update(db);
                     }
+                    self.sender.send(MainLoopMessage::CheckWorkspace).unwrap();
                 }
                 MainLoopMessage::Exit => {
-                    if self.verbosity == Some(VerbosityLevel::Trace) {
-                        eprintln!("{}", countme::get_all());
-                    }
-                    return;
+                    // Cancel any pending queries and wait for them to complete.
+                    // TODO: Don't use Salsa internal APIs
+                    //  [Zulip-Thread](https://salsa.zulipchat.com/#narrow/stream/333573-salsa-3.2E0/topic/Expose.20an.20API.20to.20cancel.20other.20queries)
+                    let _ = db.zalsa_mut();
+                    return ExitStatus::Success;
                 }
             }
+
+            tracing::debug!("Waiting for next main loop message.");
         }
-    }
-}
 
-impl Drop for MainLoop {
-    fn drop(&mut self) {
-        self.orchestrator
-            .send(OrchestratorMessage::Shutdown)
-            .unwrap();
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FileChangesNotifier {
-    sender: crossbeam_channel::Sender<OrchestratorMessage>,
-}
-
-impl FileChangesNotifier {
-    fn notify(&self, changes: Vec<FileWatcherChange>) {
-        self.sender
-            .send(OrchestratorMessage::FileChanges(changes))
-            .unwrap();
+        ExitStatus::Success
     }
 }
 
@@ -250,170 +371,11 @@ impl MainLoopCancellationToken {
     }
 }
 
-struct Orchestrator {
-    /// Sends messages to the main loop.
-    main_loop: crossbeam_channel::Sender<MainLoopMessage>,
-    /// Receives messages from the main loop.
-    receiver: crossbeam_channel::Receiver<OrchestratorMessage>,
-    revision: usize,
-}
-
-impl Orchestrator {
-    #[allow(clippy::print_stderr)]
-    fn run(&mut self) {
-        while let Ok(message) = self.receiver.recv() {
-            match message {
-                OrchestratorMessage::Run => {
-                    self.main_loop
-                        .send(MainLoopMessage::CheckWorkspace {
-                            revision: self.revision,
-                        })
-                        .unwrap();
-                }
-
-                OrchestratorMessage::CheckCompleted {
-                    diagnostics,
-                    revision,
-                } => {
-                    // Only take the diagnostics if they are for the latest revision.
-                    if self.revision == revision {
-                        self.main_loop
-                            .send(MainLoopMessage::CheckCompleted(diagnostics))
-                            .unwrap();
-                    } else {
-                        tracing::debug!("Discarding diagnostics for outdated revision {revision} (current: {}).", self.revision);
-                    }
-                }
-
-                OrchestratorMessage::FileChanges(changes) => {
-                    // Request cancellation, but wait until all analysis tasks have completed to
-                    // avoid stale messages in the next main loop.
-
-                    self.revision += 1;
-                    self.debounce_changes(changes);
-                }
-                OrchestratorMessage::Shutdown => {
-                    return self.shutdown();
-                }
-            }
-        }
-    }
-
-    fn debounce_changes(&self, mut changes: Vec<FileWatcherChange>) {
-        loop {
-            // Consume possibly incoming file change messages before running a new analysis, but don't wait for more than 100ms.
-            crossbeam_channel::select! {
-                recv(self.receiver) -> message => {
-                    match message {
-                        Ok(OrchestratorMessage::Shutdown) => {
-                            return self.shutdown();
-                        }
-                        Ok(OrchestratorMessage::FileChanges(file_changes)) => {
-                            changes.extend(file_changes);
-                        }
-
-                        Ok(OrchestratorMessage::CheckCompleted { .. })=> {
-                            // disregard any outdated completion message.
-                        }
-                        Ok(OrchestratorMessage::Run) => unreachable!("The orchestrator is already running."),
-
-                        Err(_) => {
-                            // There are no more senders, no point in waiting for more messages
-                            return;
-                        }
-                    }
-                },
-                default(std::time::Duration::from_millis(10)) => {
-                    // No more file changes after 10 ms, send the changes and schedule a new analysis
-                    self.main_loop.send(MainLoopMessage::ApplyChanges(changes)).unwrap();
-                    self.main_loop.send(MainLoopMessage::CheckWorkspace { revision: self.revision}).unwrap();
-                    return;
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::unused_self)]
-    fn shutdown(&self) {
-        tracing::trace!("Shutting down orchestrator.");
-    }
-}
-
 /// Message sent from the orchestrator to the main loop.
 #[derive(Debug)]
 enum MainLoopMessage {
-    CheckWorkspace { revision: usize },
-    CheckCompleted(Vec<String>),
-    ApplyChanges(Vec<FileWatcherChange>),
+    CheckWorkspace,
+    CheckCompleted { result: Vec<String>, revision: u64 },
+    ApplyChanges(Vec<watch::ChangeEvent>),
     Exit,
-}
-
-#[derive(Debug)]
-enum OrchestratorMessage {
-    Run,
-    Shutdown,
-
-    CheckCompleted {
-        diagnostics: Vec<String>,
-        revision: usize,
-    },
-
-    FileChanges(Vec<FileWatcherChange>),
-}
-
-fn setup_tracing(verbosity: Option<VerbosityLevel>) {
-    let trace_level = match verbosity {
-        None => Level::WARN,
-        Some(VerbosityLevel::Info) => Level::INFO,
-        Some(VerbosityLevel::Debug) => Level::DEBUG,
-        Some(VerbosityLevel::Trace) => Level::TRACE,
-    };
-
-    let subscriber = Registry::default().with(
-        tracing_tree::HierarchicalLayer::default()
-            .with_indent_lines(true)
-            .with_indent_amount(2)
-            .with_bracketed_fields(true)
-            .with_thread_ids(true)
-            .with_targets(true)
-            .with_writer(|| Box::new(std::io::stderr()))
-            .with_timer(Uptime::default())
-            .with_filter(LoggingFilter { trace_level }),
-    );
-
-    tracing::subscriber::set_global_default(subscriber).unwrap();
-}
-
-struct LoggingFilter {
-    trace_level: Level,
-}
-
-impl LoggingFilter {
-    fn is_enabled(&self, meta: &Metadata<'_>) -> bool {
-        let filter = if meta.target().starts_with("red_knot") || meta.target().starts_with("ruff") {
-            self.trace_level
-        } else {
-            Level::INFO
-        };
-
-        meta.level() <= &filter
-    }
-}
-
-impl<S> Filter<S> for LoggingFilter {
-    fn enabled(&self, meta: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
-        self.is_enabled(meta)
-    }
-
-    fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
-        if self.is_enabled(meta) {
-            Interest::always()
-        } else {
-            Interest::never()
-        }
-    }
-
-    fn max_level_hint(&self) -> Option<LevelFilter> {
-        Some(LevelFilter::from_level(self.trace_level))
-    }
 }

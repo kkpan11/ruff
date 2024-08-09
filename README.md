@@ -29,14 +29,14 @@ An extremely fast Python linter and code formatter, written in Rust.
 - 🐍 Installable via `pip`
 - 🛠️ `pyproject.toml` support
 - 🤝 Python 3.13 compatibility
-- ⚖️ Drop-in parity with [Flake8](https://docs.astral.sh/ruff/faq/#how-does-ruff-compare-to-flake8), isort, and Black
+- ⚖️ Drop-in parity with [Flake8](https://docs.astral.sh/ruff/faq/#how-does-ruffs-linter-compare-to-flake8), isort, and [Black](https://docs.astral.sh/ruff/faq/#how-does-ruffs-formatter-compare-to-black)
 - 📦 Built-in caching, to avoid re-analyzing unchanged files
 - 🔧 Fix support, for automatic error correction (e.g., automatically remove unused imports)
 - 📏 Over [800 built-in rules](https://docs.astral.sh/ruff/rules/), with native re-implementations
     of popular Flake8 plugins, like flake8-bugbear
 - ⌨️ First-party [editor integrations](https://docs.astral.sh/ruff/integrations/) for
-    [VS Code](https://github.com/astral-sh/ruff-vscode) and [more](https://github.com/astral-sh/ruff-lsp)
-- 🌎 Monorepo-friendly, with [hierarchical and cascading configuration](https://docs.astral.sh/ruff/configuration/#pyprojecttoml-discovery)
+    [VS Code](https://github.com/astral-sh/ruff-vscode) and [more](https://docs.astral.sh/ruff/editors/setup)
+- 🌎 Monorepo-friendly, with [hierarchical and cascading configuration](https://docs.astral.sh/ruff/configuration/#config-file-discovery)
 
 Ruff aims to be orders of magnitude faster than alternative tools while integrating more
 functionality behind a single, common interface.
@@ -136,8 +136,8 @@ curl -LsSf https://astral.sh/ruff/install.sh | sh
 powershell -c "irm https://astral.sh/ruff/install.ps1 | iex"
 
 # For a specific version.
-curl -LsSf https://astral.sh/ruff/0.5.3/install.sh | sh
-powershell -c "irm https://astral.sh/ruff/0.5.3/install.ps1 | iex"
+curl -LsSf https://astral.sh/ruff/0.5.7/install.sh | sh
+powershell -c "irm https://astral.sh/ruff/0.5.7/install.ps1 | iex"
 ```
 
 You can also install Ruff via [Homebrew](https://formulae.brew.sh/formula/ruff), [Conda](https://anaconda.org/conda-forge/ruff),
@@ -170,7 +170,7 @@ Ruff can also be used as a [pre-commit](https://pre-commit.com/) hook via [`ruff
 ```yaml
 - repo: https://github.com/astral-sh/ruff-pre-commit
   # Ruff version.
-  rev: v0.5.3
+  rev: v0.5.7
   hooks:
     # Run the linter.
     - id: ruff
@@ -179,8 +179,7 @@ Ruff can also be used as a [pre-commit](https://pre-commit.com/) hook via [`ruff
     - id: ruff-format
 ```
 
-Ruff can also be used as a [VS Code extension](https://github.com/astral-sh/ruff-vscode) or
-alongside any other editor through the [Ruff LSP](https://github.com/astral-sh/ruff-lsp).
+Ruff can also be used as a [VS Code extension](https://github.com/astral-sh/ruff-vscode) or with [various other editors](https://docs.astral.sh/ruff/editors/setup).
 
 Ruff can also be used as a [GitHub Action](https://github.com/features/actions) via
 [`ruff-action`](https://github.com/chartboost/ruff-action):
@@ -424,6 +423,7 @@ Ruff is used by a number of major open-source projects and companies, including:
 - [Dagger](https://github.com/dagger/dagger)
 - [Dagster](https://github.com/dagster-io/dagster)
 - Databricks ([MLflow](https://github.com/mlflow/mlflow))
+- [Dify](https://github.com/langgenius/dify)
 - [FastAPI](https://github.com/tiangolo/fastapi)
 - [Godot](https://github.com/godotengine/godot)
 - [Gradio](https://github.com/gradio-app/gradio)
@@ -434,6 +434,7 @@ Ruff is used by a number of major open-source projects and companies, including:
 - Hugging Face ([Transformers](https://github.com/huggingface/transformers),
     [Datasets](https://github.com/huggingface/datasets),
     [Diffusers](https://github.com/huggingface/diffusers))
+- IBM ([Qiskit](https://github.com/Qiskit/qiskit))
 - ING Bank ([popmon](https://github.com/ing-bank/popmon), [probatus](https://github.com/ing-bank/probatus))
 - [Ibis](https://github.com/ibis-project/ibis)
 - [ivy](https://github.com/unifyai/ivy)

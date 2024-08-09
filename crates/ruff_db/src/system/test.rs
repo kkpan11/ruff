@@ -1,11 +1,16 @@
-use ruff_notebook::{Notebook, NotebookError};
-
-use crate::files::File;
-use crate::system::{DirectoryEntry, MemoryFileSystem, Metadata, Result, System, SystemPath};
-use crate::Db;
 use std::any::Any;
 use std::panic::RefUnwindSafe;
 use std::sync::Arc;
+
+use ruff_notebook::{Notebook, NotebookError};
+use ruff_python_trivia::textwrap;
+
+use crate::files::File;
+use crate::system::{
+    DirectoryEntry, MemoryFileSystem, Metadata, Result, System, SystemPath, SystemPathBuf,
+    SystemVirtualPath,
+};
+use crate::Db;
 
 use super::walk_directory::WalkDirectoryBuilder;
 
@@ -22,12 +27,6 @@ pub struct TestSystem {
 }
 
 impl TestSystem {
-    pub fn snapshot(&self) -> Self {
-        Self {
-            inner: self.inner.snapshot(),
-        }
-    }
-
     /// Returns the memory file system.
     ///
     /// ## Panics
@@ -70,6 +69,30 @@ impl System for TestSystem {
         }
     }
 
+    fn virtual_path_metadata(&self, path: &SystemVirtualPath) -> Result<Metadata> {
+        match &self.inner {
+            TestSystemInner::Stub(fs) => fs.virtual_path_metadata(path),
+            TestSystemInner::System(system) => system.virtual_path_metadata(path),
+        }
+    }
+
+    fn read_virtual_path_to_string(&self, path: &SystemVirtualPath) -> Result<String> {
+        match &self.inner {
+            TestSystemInner::Stub(fs) => fs.read_virtual_path_to_string(path),
+            TestSystemInner::System(system) => system.read_virtual_path_to_string(path),
+        }
+    }
+
+    fn read_virtual_path_to_notebook(
+        &self,
+        path: &SystemVirtualPath,
+    ) -> std::result::Result<Notebook, NotebookError> {
+        match &self.inner {
+            TestSystemInner::Stub(fs) => fs.read_virtual_path_to_notebook(path),
+            TestSystemInner::System(system) => system.read_virtual_path_to_notebook(path),
+        }
+    }
+
     fn path_exists(&self, path: &SystemPath) -> bool {
         match &self.inner {
             TestSystemInner::Stub(fs) => fs.exists(path),
@@ -109,6 +132,10 @@ impl System for TestSystem {
         self
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn read_directory<'a>(
         &'a self,
         path: &SystemPath,
@@ -116,6 +143,13 @@ impl System for TestSystem {
         match &self.inner {
             TestSystemInner::System(fs) => fs.read_directory(path),
             TestSystemInner::Stub(fs) => Ok(Box::new(fs.read_directory(path)?)),
+        }
+    }
+
+    fn canonicalize_path(&self, path: &SystemPath) -> Result<SystemPathBuf> {
+        match &self.inner {
+            TestSystemInner::System(fs) => fs.canonicalize_path(path),
+            TestSystemInner::Stub(fs) => Ok(fs.canonicalize(path)),
         }
     }
 }
@@ -144,10 +178,24 @@ pub trait DbWithTestSystem: Db + Sized {
             .write_file(path, content);
 
         if result.is_ok() {
-            File::touch_path(self, path);
+            File::sync_path(self, path);
         }
 
         result
+    }
+
+    /// Writes the content of the given virtual file.
+    fn write_virtual_file(&mut self, path: impl AsRef<SystemVirtualPath>, content: impl ToString) {
+        let path = path.as_ref();
+        self.test_system()
+            .memory_file_system()
+            .write_virtual_file(path, content);
+    }
+
+    /// Writes auto-dedented text to a file.
+    fn write_dedented(&mut self, path: &str, content: &str) -> crate::system::Result<()> {
+        self.write_file(path, textwrap::dedent(content))?;
+        Ok(())
     }
 
     /// Writes the content of the given files and notifies the Db about the change.
@@ -192,15 +240,6 @@ pub trait DbWithTestSystem: Db + Sized {
 enum TestSystemInner {
     Stub(MemoryFileSystem),
     System(Arc<dyn System + RefUnwindSafe + Send + Sync>),
-}
-
-impl TestSystemInner {
-    fn snapshot(&self) -> Self {
-        match self {
-            Self::Stub(system) => Self::Stub(system.snapshot()),
-            Self::System(system) => Self::System(Arc::clone(system)),
-        }
-    }
 }
 
 impl Default for TestSystemInner {

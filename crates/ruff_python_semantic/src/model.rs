@@ -124,7 +124,21 @@ pub struct SemanticModel<'a> {
     /// Modules that have been seen by the semantic model.
     pub seen: Modules,
 
-    /// Exceptions that have been handled by the current scope.
+    /// Exceptions that are handled by the current `try` block.
+    ///
+    /// For example, if we're visiting the `x = 1` assignment below,
+    /// `AttributeError` is considered to be a "handled exception",
+    /// but `TypeError` is not:
+    ///
+    /// ```py
+    /// try:
+    ///     try:
+    ///         foo()
+    ///     except TypeError:
+    ///         pass
+    /// except AttributeError:
+    ///     pass
+    /// ```
     pub handled_exceptions: Vec<Exceptions>,
 
     /// Map from [`ast::ExprName`] node (represented as a [`NameId`]) to the [`Binding`] to which
@@ -1193,6 +1207,14 @@ impl<'a> SemanticModel<'a> {
             .expect("No statement found")
     }
 
+    /// Returns an [`Iterator`] over the statements, starting from the given [`NodeId`].
+    /// through to any parents.
+    pub fn statements(&self, node_id: NodeId) -> impl Iterator<Item = &'a Stmt> + '_ {
+        self.nodes
+            .ancestor_ids(node_id)
+            .filter_map(move |id| self.nodes[id].as_statement())
+    }
+
     /// Given a [`Stmt`], return its parent, if any.
     #[inline]
     pub fn parent_statement(&self, node_id: NodeId) -> Option<&'a Stmt> {
@@ -1238,6 +1260,7 @@ impl<'a> SemanticModel<'a> {
             "dataclasses" => self.seen.insert(Modules::DATACLASSES),
             "datetime" => self.seen.insert(Modules::DATETIME),
             "django" => self.seen.insert(Modules::DJANGO),
+            "fastapi" => self.seen.insert(Modules::FASTAPI),
             "logging" => self.seen.insert(Modules::LOGGING),
             "mock" => self.seen.insert(Modules::MOCK),
             "numpy" => self.seen.insert(Modules::NUMPY),
@@ -1432,7 +1455,7 @@ impl<'a> SemanticModel<'a> {
                     .get_all(id)
                     .map(|binding_id| self.binding(binding_id))
                     .filter(|binding| binding.start() >= expr.start())
-                    .all(|binding| !binding.is_used())
+                    .all(Binding::is_unused)
             }
             _ => false,
         }
@@ -1824,6 +1847,7 @@ bitflags! {
         const BUILTINS = 1 << 18;
         const CONTEXTVARS = 1 << 19;
         const ANYIO = 1 << 20;
+        const FASTAPI = 1 << 21;
     }
 }
 

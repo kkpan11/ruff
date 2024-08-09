@@ -8,11 +8,11 @@ use ruff_text_size::Ranged;
 use crate::checkers::ast::Checker;
 use crate::registry::Rule;
 use crate::rules::{
-    airflow, flake8_async, flake8_bandit, flake8_boolean_trap, flake8_bugbear, flake8_builtins,
-    flake8_debugger, flake8_django, flake8_errmsg, flake8_import_conventions, flake8_pie,
-    flake8_pyi, flake8_pytest_style, flake8_raise, flake8_return, flake8_simplify, flake8_slots,
-    flake8_tidy_imports, flake8_type_checking, mccabe, pandas_vet, pep8_naming, perflint,
-    pycodestyle, pyflakes, pygrep_hooks, pylint, pyupgrade, refurb, ruff, tryceratops,
+    airflow, fastapi, flake8_async, flake8_bandit, flake8_boolean_trap, flake8_bugbear,
+    flake8_builtins, flake8_debugger, flake8_django, flake8_errmsg, flake8_import_conventions,
+    flake8_pie, flake8_pyi, flake8_pytest_style, flake8_raise, flake8_return, flake8_simplify,
+    flake8_slots, flake8_tidy_imports, flake8_type_checking, mccabe, pandas_vet, pep8_naming,
+    perflint, pycodestyle, pyflakes, pygrep_hooks, pylint, pyupgrade, refurb, ruff, tryceratops,
 };
 use crate::settings::types::PythonVersion;
 
@@ -87,6 +87,12 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
         ) => {
             if checker.enabled(Rule::DjangoNonLeadingReceiverDecorator) {
                 flake8_django::rules::non_leading_receiver_decorator(checker, decorator_list);
+            }
+            if checker.enabled(Rule::FastApiRedundantResponseModel) {
+                fastapi::rules::fastapi_redundant_response_model(checker, function_def);
+            }
+            if checker.enabled(Rule::FastApiNonAnnotatedDependency) {
+                fastapi::rules::fastapi_non_annotated_dependency(checker, function_def);
             }
             if checker.enabled(Rule::AmbiguousFunctionName) {
                 if let Some(diagnostic) = pycodestyle::rules::ambiguous_function_name(name) {
@@ -591,8 +597,11 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
                 if checker.enabled(Rule::NonAsciiImportName) {
                     pylint::rules::non_ascii_module_import(checker, alias);
                 }
+                // TODO(charlie): Remove when stabilizing A004.
                 if let Some(asname) = &alias.asname {
-                    if checker.enabled(Rule::BuiltinVariableShadowing) {
+                    if checker.settings.preview.is_disabled()
+                        && checker.enabled(Rule::BuiltinVariableShadowing)
+                    {
                         flake8_builtins::rules::builtin_variable_shadowing(
                             checker,
                             asname,
@@ -732,6 +741,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
                     ) {
                         checker.diagnostics.push(diagnostic);
                     }
+                }
+                if checker.enabled(Rule::BuiltinImportShadowing) {
+                    flake8_builtins::rules::builtin_import_shadowing(checker, alias);
                 }
             }
         }
@@ -911,8 +923,11 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
                         ));
                     }
                 } else {
+                    // TODO(charlie): Remove when stabilizing A004.
                     if let Some(asname) = &alias.asname {
-                        if checker.enabled(Rule::BuiltinVariableShadowing) {
+                        if checker.settings.preview.is_disabled()
+                            && checker.enabled(Rule::BuiltinVariableShadowing)
+                        {
                             flake8_builtins::rules::builtin_variable_shadowing(
                                 checker,
                                 asname,
@@ -1023,6 +1038,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
                             pylint::rules::useless_import_alias(checker, alias);
                         }
                     }
+                }
+                if checker.enabled(Rule::BuiltinImportShadowing) {
+                    flake8_builtins::rules::builtin_import_shadowing(checker, alias);
                 }
             }
             if checker.enabled(Rule::ImportSelf) {
@@ -1573,9 +1591,6 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             if checker.settings.rules.enabled(Rule::UnsortedDunderAll) {
                 ruff::rules::sort_dunder_all_assign(checker, assign);
             }
-            if checker.enabled(Rule::UnsortedDunderSlots) {
-                ruff::rules::sort_dunder_slots_assign(checker, assign);
-            }
             if checker.source_type.is_stub() {
                 if checker.any_enabled(&[
                     Rule::UnprefixedTypeParam,
@@ -1657,9 +1672,6 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             }
             if checker.settings.rules.enabled(Rule::UnsortedDunderAll) {
                 ruff::rules::sort_dunder_all_ann_assign(checker, assign_stmt);
-            }
-            if checker.enabled(Rule::UnsortedDunderSlots) {
-                ruff::rules::sort_dunder_slots_ann_assign(checker, assign_stmt);
             }
             if checker.source_type.is_stub() {
                 if let Some(value) = value {

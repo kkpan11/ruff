@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
-
 use regex::Regex;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 
+use crate::options_base::{OptionsMetadata, Visit};
+use crate::settings::LineEnding;
 use ruff_formatter::IndentStyle;
 use ruff_linter::line_width::{IndentWidth, LineLength};
 use ruff_linter::rules::flake8_import_conventions::settings::BannedAliases;
@@ -21,7 +21,7 @@ use ruff_linter::rules::{
     flake8_copyright, flake8_errmsg, flake8_gettext, flake8_implicit_str_concat,
     flake8_import_conventions, flake8_pytest_style, flake8_quotes, flake8_self,
     flake8_tidy_imports, flake8_type_checking, flake8_unused_arguments, isort, mccabe, pep8_naming,
-    pycodestyle, pydocstyle, pyflakes, pylint, pyupgrade,
+    pycodestyle, pydocstyle, pyflakes, pylint, pyupgrade, ruff,
 };
 use ruff_linter::settings::types::{
     IdentifierPattern, OutputFormat, PreviewMode, PythonVersion, RequiredVersion,
@@ -30,9 +30,7 @@ use ruff_linter::{warn_user_once, RuleSelector};
 use ruff_macros::{CombineOptions, OptionsMetadata};
 use ruff_python_ast::name::Name;
 use ruff_python_formatter::{DocstringCodeLineWidth, QuoteStyle};
-
-use crate::options_base::{OptionsMetadata, Visit};
-use crate::settings::LineEnding;
+use ruff_python_semantic::NameImports;
 
 #[derive(Clone, Debug, PartialEq, Eq, Default, OptionsMetadata, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -242,6 +240,10 @@ pub struct Options {
     /// `*.pyw`, to include any file with the `.pyw` extension. `pyproject.toml` is
     /// included here not for configuration but because we lint whether e.g. the
     /// `[project]` matches the schema.
+    ///
+    /// If [preview](https://docs.astral.sh/ruff/preview/) is enabled, the default
+    /// includes notebook files (`.ipynb` extension). You can exclude them by adding
+    /// `*.ipynb` to [`extend-exclude`](#extend-exclude).
     ///
     /// For more information on the glob syntax, refer to the [`globset` documentation](https://docs.rs/globset/latest/globset/#syntax).
     #[option(
@@ -453,6 +455,10 @@ pub struct LintOptions {
     )]
     pub exclude: Option<Vec<String>>,
 
+    /// Options for the `ruff` plugin
+    #[option_group]
+    pub ruff: Option<RuffOptions>,
+
     /// Whether to enable preview mode. When preview mode is enabled, Ruff will
     /// use unstable rules and fixes.
     #[option(
@@ -481,12 +487,12 @@ impl OptionsMetadata for DeprecatedTopLevelLintOptions {
 
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for DeprecatedTopLevelLintOptions {
-    fn schema_name() -> std::string::String {
+    fn schema_name() -> String {
         "DeprecatedTopLevelLintOptions".to_owned()
     }
     fn schema_id() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed(std::concat!(
-            std::module_path!(),
+        std::borrow::Cow::Borrowed(concat!(
+            module_path!(),
             "::",
             "DeprecatedTopLevelLintOptions"
         ))
@@ -1104,12 +1110,20 @@ pub struct Flake8BuiltinsOptions {
     )]
     /// Ignore list of builtins.
     pub builtins_ignorelist: Option<Vec<String>>,
+    #[option(
+        default = r#"[]"#,
+        value_type = "list[str]",
+        example = "builtins-allowed-modules = [\"id\"]"
+    )]
+    /// List of builtin module names to allow.
+    pub builtins_allowed_modules: Option<Vec<String>>,
 }
 
 impl Flake8BuiltinsOptions {
     pub fn into_settings(self) -> ruff_linter::rules::flake8_builtins::settings::Settings {
         ruff_linter::rules::flake8_builtins::settings::Settings {
             builtins_ignorelist: self.builtins_ignorelist.unwrap_or_default(),
+            builtins_allowed_modules: self.builtins_allowed_modules.unwrap_or_default(),
         }
     }
 }
@@ -1260,10 +1274,11 @@ pub struct Flake8ImplicitStrConcatOptions {
     /// allowed (but continuation lines, delimited with a backslash, are
     /// prohibited).
     ///
-    /// Note that setting `allow-multiline = false` should typically be coupled
-    /// with disabling `explicit-string-concatenation` (`ISC003`). Otherwise,
-    /// both explicit and implicit multiline string concatenations will be seen
-    /// as violations.
+    /// Setting `allow-multiline = false` will automatically disable the
+    /// `explicit-string-concatenation` (`ISC003`) rule. Otherwise, both
+    /// implicit and explicit multiline string concatenations would be seen
+    /// as violations, making it impossible to write a linter-compliant multiline
+    /// string.
     #[option(
         default = r#"true"#,
         value_type = "bool",
@@ -2034,7 +2049,7 @@ pub struct IsortOptions {
             required-imports = ["from __future__ import annotations"]
         "#
     )]
-    pub required_imports: Option<Vec<String>>,
+    pub required_imports: Option<Vec<NameImports>>,
 
     /// An override list of tokens to always recognize as a Class for
     /// [`order-by-type`](#lint_isort_order-by-type) regardless of casing.
@@ -2434,7 +2449,12 @@ impl IsortOptions {
         }
 
         Ok(isort::settings::Settings {
-            required_imports: BTreeSet::from_iter(self.required_imports.unwrap_or_default()),
+            required_imports: self
+                .required_imports
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(NameImports::into_imports)
+                .collect(),
             combine_as_imports: self.combine_as_imports.unwrap_or(false),
             force_single_line: self.force_single_line.unwrap_or(false),
             force_sort_within_sections,
@@ -2748,11 +2768,16 @@ pub struct PydocstyleOptions {
 
 impl PydocstyleOptions {
     pub fn into_settings(self) -> pydocstyle::settings::Settings {
-        pydocstyle::settings::Settings {
-            convention: self.convention,
-            ignore_decorators: BTreeSet::from_iter(self.ignore_decorators.unwrap_or_default()),
-            property_decorators: BTreeSet::from_iter(self.property_decorators.unwrap_or_default()),
-        }
+        let PydocstyleOptions {
+            convention,
+            ignore_decorators,
+            property_decorators,
+        } = self;
+        pydocstyle::settings::Settings::new(
+            convention,
+            ignore_decorators.unwrap_or_default(),
+            property_decorators.unwrap_or_default(),
+        )
     }
 }
 
@@ -2944,6 +2969,35 @@ impl PyUpgradeOptions {
     pub fn into_settings(self) -> pyupgrade::settings::Settings {
         pyupgrade::settings::Settings {
             keep_runtime_typing: self.keep_runtime_typing.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct RuffOptions {
+    /// Whether to prefer accessing items keyed by tuples with
+    /// parentheses around the tuple (see `RUF031`).
+    #[option(
+        default = r#"false"#,
+        value_type = "bool",
+        example = r#"
+        # Make it a violation to use a tuple in a subscript without parentheses.
+        parenthesize-tuple-in-subscript = true
+        "#
+    )]
+    pub parenthesize_tuple_in_subscript: Option<bool>,
+}
+
+impl RuffOptions {
+    pub fn into_settings(self) -> ruff::settings::Settings {
+        ruff::settings::Settings {
+            parenthesize_tuple_in_subscript: self
+                .parenthesize_tuple_in_subscript
+                .unwrap_or_default(),
         }
     }
 }

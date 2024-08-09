@@ -3,6 +3,7 @@
 //    but there's no compile time guarantee that a [`OsSystem`] never gets an untitled file path.
 
 use camino::{Utf8Path, Utf8PathBuf};
+use std::borrow::Borrow;
 use std::fmt::Formatter;
 use std::ops::Deref;
 use std::path::{Path, StripPrefixError};
@@ -402,6 +403,14 @@ impl SystemPath {
     }
 }
 
+impl ToOwned for SystemPath {
+    type Owned = SystemPathBuf;
+
+    fn to_owned(&self) -> Self::Owned {
+        self.to_path_buf()
+    }
+}
+
 /// An owned, mutable path on [`System`](`super::System`) (akin to [`String`]).
 ///
 /// The path is guaranteed to be valid UTF-8.
@@ -470,6 +479,12 @@ impl SystemPathBuf {
     }
 }
 
+impl Borrow<SystemPath> for SystemPathBuf {
+    fn borrow(&self) -> &SystemPath {
+        self.as_path()
+    }
+}
+
 impl From<&str> for SystemPathBuf {
     fn from(value: &str) -> Self {
         SystemPathBuf::from_utf8_path_buf(Utf8PathBuf::from(value))
@@ -493,6 +508,20 @@ impl AsRef<SystemPath> for SystemPath {
     #[inline]
     fn as_ref(&self) -> &SystemPath {
         self
+    }
+}
+
+impl AsRef<SystemPath> for Utf8Path {
+    #[inline]
+    fn as_ref(&self) -> &SystemPath {
+        SystemPath::new(self)
+    }
+}
+
+impl AsRef<SystemPath> for Utf8PathBuf {
+    #[inline]
+    fn as_ref(&self) -> &SystemPath {
+        SystemPath::new(self.as_path())
     }
 }
 
@@ -561,5 +590,200 @@ impl ruff_cache::CacheKey for SystemPath {
 impl ruff_cache::CacheKey for SystemPathBuf {
     fn cache_key(&self, hasher: &mut ruff_cache::CacheKeyHasher) {
         self.as_path().cache_key(hasher);
+    }
+}
+
+/// A slice of a virtual path on [`System`](super::System) (akin to [`str`]).
+#[repr(transparent)]
+pub struct SystemVirtualPath(str);
+
+impl SystemVirtualPath {
+    pub fn new(path: &str) -> &SystemVirtualPath {
+        // SAFETY: SystemVirtualPath is marked as #[repr(transparent)] so the conversion from a
+        // *const str to a *const SystemVirtualPath is valid.
+        unsafe { &*(path as *const str as *const SystemVirtualPath) }
+    }
+
+    /// Converts the path to an owned [`SystemVirtualPathBuf`].
+    pub fn to_path_buf(&self) -> SystemVirtualPathBuf {
+        SystemVirtualPathBuf(self.0.to_string())
+    }
+
+    /// Extracts the file extension, if possible.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ruff_db::system::SystemVirtualPath;
+    ///
+    /// assert_eq!(None, SystemVirtualPath::new("untitled:Untitled-1").extension());
+    /// assert_eq!("ipynb", SystemVirtualPath::new("untitled:Untitled-1.ipynb").extension().unwrap());
+    /// assert_eq!("ipynb", SystemVirtualPath::new("vscode-notebook-cell:Untitled-1.ipynb").extension().unwrap());
+    /// ```
+    ///
+    /// See [`Path::extension`] for more details.
+    pub fn extension(&self) -> Option<&str> {
+        Path::new(&self.0).extension().and_then(|ext| ext.to_str())
+    }
+
+    /// Returns the path as a string slice.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// An owned, virtual path on [`System`](`super::System`) (akin to [`String`]).
+#[derive(Eq, PartialEq, Clone, Hash, PartialOrd, Ord)]
+pub struct SystemVirtualPathBuf(String);
+
+impl SystemVirtualPathBuf {
+    #[inline]
+    pub fn as_path(&self) -> &SystemVirtualPath {
+        SystemVirtualPath::new(&self.0)
+    }
+}
+
+impl From<String> for SystemVirtualPathBuf {
+    fn from(value: String) -> Self {
+        SystemVirtualPathBuf(value)
+    }
+}
+
+impl AsRef<SystemVirtualPath> for SystemVirtualPathBuf {
+    #[inline]
+    fn as_ref(&self) -> &SystemVirtualPath {
+        self.as_path()
+    }
+}
+
+impl AsRef<SystemVirtualPath> for SystemVirtualPath {
+    #[inline]
+    fn as_ref(&self) -> &SystemVirtualPath {
+        self
+    }
+}
+
+impl AsRef<SystemVirtualPath> for str {
+    #[inline]
+    fn as_ref(&self) -> &SystemVirtualPath {
+        SystemVirtualPath::new(self)
+    }
+}
+
+impl AsRef<SystemVirtualPath> for String {
+    #[inline]
+    fn as_ref(&self) -> &SystemVirtualPath {
+        SystemVirtualPath::new(self)
+    }
+}
+
+impl Deref for SystemVirtualPathBuf {
+    type Target = SystemVirtualPath;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_path()
+    }
+}
+
+impl std::fmt::Debug for SystemVirtualPath {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::fmt::Display for SystemVirtualPath {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::fmt::Debug for SystemVirtualPathBuf {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::fmt::Display for SystemVirtualPathBuf {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[cfg(feature = "cache")]
+impl ruff_cache::CacheKey for SystemVirtualPath {
+    fn cache_key(&self, hasher: &mut ruff_cache::CacheKeyHasher) {
+        self.as_str().cache_key(hasher);
+    }
+}
+
+#[cfg(feature = "cache")]
+impl ruff_cache::CacheKey for SystemVirtualPathBuf {
+    fn cache_key(&self, hasher: &mut ruff_cache::CacheKeyHasher) {
+        self.as_path().cache_key(hasher);
+    }
+}
+
+/// Deduplicates identical paths and removes nested paths.
+///
+/// # Examples
+/// ```rust
+/// use ruff_db::system::{SystemPath, deduplicate_nested_paths};///
+///
+/// let paths = vec![SystemPath::new("/a/b/c"), SystemPath::new("/a/b"), SystemPath::new("/a/beta"), SystemPath::new("/a/b/c")];
+/// assert_eq!(deduplicate_nested_paths(paths).collect::<Vec<_>>(), &[SystemPath::new("/a/b"), SystemPath::new("/a/beta")]);
+/// ```
+pub fn deduplicate_nested_paths<P, I>(paths: I) -> DeduplicatedNestedPathsIter<P>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<SystemPath>,
+{
+    DeduplicatedNestedPathsIter::new(paths)
+}
+
+pub struct DeduplicatedNestedPathsIter<P> {
+    inner: std::vec::IntoIter<P>,
+    next: Option<P>,
+}
+
+impl<P> DeduplicatedNestedPathsIter<P>
+where
+    P: AsRef<SystemPath>,
+{
+    fn new<I>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+    {
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        // Sort the path to ensure that e.g. `/a/b/c`, comes right after `/a/b`.
+        paths.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
+
+        let mut iter = paths.into_iter();
+
+        Self {
+            next: iter.next(),
+            inner: iter,
+        }
+    }
+}
+
+impl<P> Iterator for DeduplicatedNestedPathsIter<P>
+where
+    P: AsRef<SystemPath>,
+{
+    type Item = P;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next.take()?;
+
+        for next in self.inner.by_ref() {
+            // Skip all paths that have the same prefix as the current path
+            if !next.as_ref().starts_with(current.as_ref()) {
+                self.next = Some(next);
+                break;
+            }
+        }
+
+        Some(current)
     }
 }

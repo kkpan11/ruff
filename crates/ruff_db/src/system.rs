@@ -9,7 +9,10 @@ use walk_directory::WalkDirectoryBuilder;
 
 use crate::file_revision::FileRevision;
 
-pub use self::path::{SystemPath, SystemPathBuf};
+pub use self::path::{
+    deduplicate_nested_paths, DeduplicatedNestedPathsIter, SystemPath, SystemPathBuf,
+    SystemVirtualPath, SystemVirtualPathBuf,
+};
 
 mod memory_fs;
 #[cfg(feature = "os")]
@@ -36,7 +39,19 @@ pub type Result<T> = std::io::Result<T>;
 /// Abstracting the system also enables tests to use a more efficient in-memory file system.
 pub trait System: Debug {
     /// Reads the metadata of the file or directory at `path`.
+    ///
+    /// This function will traverse symbolic links to query information about the destination file.
     fn path_metadata(&self, path: &SystemPath) -> Result<Metadata>;
+
+    /// Returns the canonical, absolute form of a path with all intermediate components normalized
+    /// and symbolic links resolved.
+    ///
+    /// # Errors
+    /// This function will return an error in the following situations, but is not limited to just these cases:
+    /// * `path` does not exist.
+    /// * A non-final component in `path` is not a directory.
+    /// * the symlink target path is not valid Unicode.
+    fn canonicalize_path(&self, path: &SystemPath) -> Result<SystemPathBuf>;
 
     /// Reads the content of the file at `path` into a [`String`].
     fn read_to_string(&self, path: &SystemPath) -> Result<String>;
@@ -47,6 +62,18 @@ pub trait System: Debug {
     /// allowing to skip the notebook deserialization. Systems that don't use a structured
     /// representation fall-back to deserializing the notebook from a string.
     fn read_to_notebook(&self, path: &SystemPath) -> std::result::Result<Notebook, NotebookError>;
+
+    /// Reads the metadata of the virtual file at `path`.
+    fn virtual_path_metadata(&self, path: &SystemVirtualPath) -> Result<Metadata>;
+
+    /// Reads the content of the virtual file at `path` into a [`String`].
+    fn read_virtual_path_to_string(&self, path: &SystemVirtualPath) -> Result<String>;
+
+    /// Reads the content of the virtual file at `path` as a [`Notebook`].
+    fn read_virtual_path_to_notebook(
+        &self,
+        path: &SystemVirtualPath,
+    ) -> std::result::Result<Notebook, NotebookError>;
 
     /// Returns `true` if `path` exists.
     fn path_exists(&self, path: &SystemPath) -> bool {
@@ -103,6 +130,8 @@ pub trait System: Debug {
     fn walk_directory(&self, path: &SystemPath) -> WalkDirectoryBuilder;
 
     fn as_any(&self) -> &dyn std::any::Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +142,14 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    pub fn new(revision: FileRevision, permissions: Option<u32>, file_type: FileType) -> Self {
+        Self {
+            revision,
+            permissions,
+            file_type,
+        }
+    }
+
     pub fn revision(&self) -> FileRevision {
         self.revision
     }

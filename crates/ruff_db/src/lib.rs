@@ -1,31 +1,26 @@
 use std::hash::BuildHasherDefault;
 
-use program::Program;
 use rustc_hash::FxHasher;
-use salsa::DbWithJar;
 
-use crate::files::{File, Files};
-use crate::parsed::parsed_module;
-use crate::source::{line_index, source_text};
+use crate::files::Files;
 use crate::system::System;
 use crate::vendored::VendoredFileSystem;
 
 pub mod file_revision;
 pub mod files;
 pub mod parsed;
-pub mod program;
 pub mod source;
 pub mod system;
+#[cfg(feature = "testing")]
 pub mod testing;
 pub mod vendored;
 
-pub(crate) type FxDashMap<K, V> = dashmap::DashMap<K, V, BuildHasherDefault<FxHasher>>;
-
-#[salsa::jar(db=Db)]
-pub struct Jar(File, Program, source_text, line_index, parsed_module);
+pub type FxDashMap<K, V> = dashmap::DashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub type FxDashSet<K> = dashmap::DashSet<K, BuildHasherDefault<FxHasher>>;
 
 /// Most basic database that gives access to files, the host system, source code, and parsed AST.
-pub trait Db: DbWithJar<Jar> {
+#[salsa::db]
+pub trait Db: salsa::Database {
     fn vendored(&self) -> &VendoredFileSystem;
     fn system(&self) -> &dyn System;
     fn files(&self) -> &Files;
@@ -34,25 +29,24 @@ pub trait Db: DbWithJar<Jar> {
 /// Trait for upcasting a reference to a base trait object.
 pub trait Upcast<T: ?Sized> {
     fn upcast(&self) -> &T;
+    fn upcast_mut(&mut self) -> &mut T;
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use salsa::DebugWithDb;
-
     use crate::files::Files;
     use crate::system::TestSystem;
     use crate::system::{DbWithTestSystem, System};
     use crate::vendored::VendoredFileSystem;
-    use crate::{Db, Jar};
+    use crate::Db;
 
     /// Database that can be used for testing.
     ///
     /// Uses an in memory filesystem and it stubs out the vendored files by default.
+    #[salsa::db]
     #[derive(Default)]
-    #[salsa::db(Jar)]
     pub(crate) struct TestDb {
         storage: salsa::Storage<Self>,
         files: Files,
@@ -99,6 +93,7 @@ mod tests {
         }
     }
 
+    #[salsa::db]
     impl Db for TestDb {
         fn vendored(&self) -> &VendoredFileSystem {
             &self.vendored
@@ -123,23 +118,13 @@ mod tests {
         }
     }
 
+    #[salsa::db]
     impl salsa::Database for TestDb {
-        fn salsa_event(&self, event: salsa::Event) {
-            tracing::trace!("event: {:?}", event.debug(self));
+        fn salsa_event(&self, event: &dyn Fn() -> salsa::Event) {
+            let event = event();
+            tracing::trace!("event: {:?}", event);
             let mut events = self.events.lock().unwrap();
             events.push(event);
-        }
-    }
-
-    impl salsa::ParallelDatabase for TestDb {
-        fn snapshot(&self) -> salsa::Snapshot<Self> {
-            salsa::Snapshot::new(Self {
-                storage: self.storage.snapshot(),
-                system: self.system.snapshot(),
-                files: self.files.snapshot(),
-                events: self.events.clone(),
-                vendored: self.vendored.snapshot(),
-            })
         }
     }
 }

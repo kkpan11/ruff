@@ -7,6 +7,7 @@ use ruff_notebook::{Notebook, NotebookError};
 
 use crate::system::{
     DirectoryEntry, FileType, Metadata, Result, System, SystemPath, SystemPathBuf,
+    SystemVirtualPath,
 };
 
 use super::walk_directory::{
@@ -48,12 +49,6 @@ impl OsSystem {
     fn permissions(_metadata: &std::fs::Metadata) -> Option<u32> {
         None
     }
-
-    pub fn snapshot(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
 }
 
 impl System for OsSystem {
@@ -68,12 +63,33 @@ impl System for OsSystem {
         })
     }
 
+    fn canonicalize_path(&self, path: &SystemPath) -> Result<SystemPathBuf> {
+        path.as_utf8_path()
+            .canonicalize_utf8()
+            .map(SystemPathBuf::from_utf8_path_buf)
+    }
+
     fn read_to_string(&self, path: &SystemPath) -> Result<String> {
         std::fs::read_to_string(path.as_std_path())
     }
 
     fn read_to_notebook(&self, path: &SystemPath) -> std::result::Result<Notebook, NotebookError> {
         Notebook::from_path(path.as_std_path())
+    }
+
+    fn virtual_path_metadata(&self, _path: &SystemVirtualPath) -> Result<Metadata> {
+        Err(not_found())
+    }
+
+    fn read_virtual_path_to_string(&self, _path: &SystemVirtualPath) -> Result<String> {
+        Err(not_found())
+    }
+
+    fn read_virtual_path_to_notebook(
+        &self,
+        _path: &SystemVirtualPath,
+    ) -> std::result::Result<Notebook, NotebookError> {
+        Err(NotebookError::from(not_found()))
     }
 
     fn path_exists(&self, path: &SystemPath) -> bool {
@@ -93,6 +109,10 @@ impl System for OsSystem {
     }
 
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -273,6 +293,10 @@ impl From<WalkState> for ignore::WalkState {
             WalkState::Quit => ignore::WalkState::Quit,
         }
     }
+}
+
+fn not_found() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory")
 }
 
 #[cfg(test)]

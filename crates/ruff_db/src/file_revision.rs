@@ -7,12 +7,16 @@
 /// * The last modification time of the file.
 /// * The hash of the file's content.
 /// * The revision as it comes from an external system, for example the LSP.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
 pub struct FileRevision(u128);
 
 impl FileRevision {
     pub fn new(value: u128) -> Self {
         Self(value)
+    }
+
+    pub fn now() -> Self {
+        Self::from(filetime::FileTime::now())
     }
 
     pub const fn zero() -> Self {

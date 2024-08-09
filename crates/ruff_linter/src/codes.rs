@@ -310,6 +310,10 @@ pub fn code_to_rule(linter: Linter, code: &str) -> Option<(RuleGroup, Rule)> {
         (Flake8Builtins, "001") => (RuleGroup::Stable, rules::flake8_builtins::rules::BuiltinVariableShadowing),
         (Flake8Builtins, "002") => (RuleGroup::Stable, rules::flake8_builtins::rules::BuiltinArgumentShadowing),
         (Flake8Builtins, "003") => (RuleGroup::Stable, rules::flake8_builtins::rules::BuiltinAttributeShadowing),
+        // TODO(charlie): When stabilizing, remove preview gating for A001's treatment of imports.
+        (Flake8Builtins, "004") => (RuleGroup::Preview, rules::flake8_builtins::rules::BuiltinImportShadowing),
+        (Flake8Builtins, "005") => (RuleGroup::Preview, rules::flake8_builtins::rules::BuiltinModuleShadowing),
+        (Flake8Builtins, "006") => (RuleGroup::Preview, rules::flake8_builtins::rules::BuiltinLambdaArgumentShadowing),
 
         // flake8-bugbear
         (Flake8Bugbear, "002") => (RuleGroup::Stable, rules::flake8_bugbear::rules::UnaryPrefixIncrementDecrement),
@@ -912,6 +916,18 @@ pub fn code_to_rule(linter: Linter, code: &str) -> Option<(RuleGroup, Rule)> {
         (Numpy, "003") => (RuleGroup::Stable, rules::numpy::rules::NumpyDeprecatedFunction),
         (Numpy, "201") => (RuleGroup::Stable, rules::numpy::rules::Numpy2Deprecation),
 
+        // fastapi
+        (FastApi, "001") => (RuleGroup::Preview, rules::fastapi::rules::FastApiRedundantResponseModel),
+        (FastApi, "002") => (RuleGroup::Preview, rules::fastapi::rules::FastApiNonAnnotatedDependency),
+
+        // pydoclint
+        (Pydoclint, "201") => (RuleGroup::Preview, rules::pydoclint::rules::DocstringMissingReturns),
+        (Pydoclint, "202") => (RuleGroup::Preview, rules::pydoclint::rules::DocstringExtraneousReturns),
+        (Pydoclint, "402") => (RuleGroup::Preview, rules::pydoclint::rules::DocstringMissingYields),
+        (Pydoclint, "403") => (RuleGroup::Preview, rules::pydoclint::rules::DocstringExtraneousYields),
+        (Pydoclint, "501") => (RuleGroup::Preview, rules::pydoclint::rules::DocstringMissingException),
+        (Pydoclint, "502") => (RuleGroup::Preview, rules::pydoclint::rules::DocstringExtraneousException),
+
         // ruff
         (Ruff, "001") => (RuleGroup::Stable, rules::ruff::rules::AmbiguousUnicodeCharacterString),
         (Ruff, "002") => (RuleGroup::Stable, rules::ruff::rules::AmbiguousUnicodeCharacterDocstring),
@@ -941,8 +957,10 @@ pub fn code_to_rule(linter: Linter, code: &str) -> Option<(RuleGroup, Rule)> {
         (Ruff, "028") => (RuleGroup::Preview, rules::ruff::rules::InvalidFormatterSuppressionComment),
         (Ruff, "029") => (RuleGroup::Preview, rules::ruff::rules::UnusedAsync),
         (Ruff, "030") => (RuleGroup::Preview, rules::ruff::rules::AssertWithPrintMessage),
+        (Ruff, "031") => (RuleGroup::Preview, rules::ruff::rules::IncorrectlyParenthesizedTupleInSubscript),
         (Ruff, "100") => (RuleGroup::Stable, rules::ruff::rules::UnusedNOQA),
         (Ruff, "101") => (RuleGroup::Preview, rules::ruff::rules::RedirectedNOQA),
+
         (Ruff, "200") => (RuleGroup::Stable, rules::ruff::rules::InvalidPyprojectToml),
         #[cfg(any(feature = "test-rules", test))]
         (Ruff, "900") => (RuleGroup::Stable, rules::ruff::rules::StableTestRule),
