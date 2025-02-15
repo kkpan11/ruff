@@ -1,6 +1,8 @@
+use core::fmt;
 use itertools::Itertools;
-use ruff_db::diagnostic::{LintName, Severity};
+use ruff_db::diagnostic::{DiagnosticId, LintName, Severity};
 use rustc_hash::FxHashMap;
+use std::fmt::Formatter;
 use std::hash::Hasher;
 use thiserror::Error;
 
@@ -36,13 +38,20 @@ pub struct LintMetadata {
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum Level {
+    /// # Ignore
+    ///
     /// The lint is disabled and should not run.
     Ignore,
 
+    /// # Warn
+    ///
     /// The lint is enabled and diagnostic should have a warning severity.
     Warn,
 
+    /// # Error
+    ///
     /// The lint is enabled and diagnostics have an error severity.
     Error,
 }
@@ -58,6 +67,16 @@ impl Level {
 
     pub const fn is_ignore(self) -> bool {
         matches!(self, Level::Ignore)
+    }
+}
+
+impl fmt::Display for Level {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Level::Ignore => f.write_str("ignore"),
+            Level::Warn => f.write_str("warn"),
+            Level::Error => f.write_str("error"),
+        }
     }
 }
 
@@ -84,9 +103,11 @@ impl LintMetadata {
 
     /// Returns the documentation line by line with one leading space and all trailing whitespace removed.
     pub fn documentation_lines(&self) -> impl Iterator<Item = &str> {
-        self.raw_documentation
-            .lines()
-            .map(|line| line.strip_prefix(' ').unwrap_or(line).trim_end())
+        self.raw_documentation.lines().map(|line| {
+            line.strip_prefix(char::is_whitespace)
+                .unwrap_or(line)
+                .trim_end()
+        })
     }
 
     /// Returns the documentation as a single string.
@@ -180,6 +201,10 @@ impl LintStatus {
     pub const fn is_removed(&self) -> bool {
         matches!(self, LintStatus::Removed { .. })
     }
+
+    pub const fn is_deprecated(&self) -> bool {
+        matches!(self, LintStatus::Deprecated { .. })
+    }
 }
 
 /// Declares a lint rule with the given metadata.
@@ -223,7 +248,7 @@ macro_rules! declare_lint {
         $vis static $name: $crate::lint::LintMetadata = $crate::lint::LintMetadata {
             name: ruff_db::diagnostic::LintName::of(ruff_macros::kebab_case!($name)),
             summary: $summary,
-            raw_documentation: concat!($($doc,)+ "\n"),
+            raw_documentation: concat!($($doc, '\n',)+),
             status: $status,
             file: file!(),
             line: line!(),
@@ -345,7 +370,18 @@ impl LintRegistry {
                 }
             }
             Some(LintEntry::Removed(lint)) => Err(GetLintError::Removed(lint.name())),
-            None => Err(GetLintError::Unknown(code.to_string())),
+            None => {
+                if let Some(without_prefix) = DiagnosticId::strip_category(code) {
+                    if let Some(entry) = self.by_name.get(without_prefix) {
+                        return Err(GetLintError::PrefixedWithCategory {
+                            prefixed: code.to_string(),
+                            suggestion: entry.id().name.to_string(),
+                        });
+                    }
+                }
+
+                Err(GetLintError::Unknown(code.to_string()))
+            }
         }
     }
 
@@ -382,12 +418,20 @@ impl LintRegistry {
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum GetLintError {
     /// The name maps to this removed lint.
-    #[error("lint {0} has been removed")]
+    #[error("lint `{0}` has been removed")]
     Removed(LintName),
 
     /// No lint with the given name is known.
-    #[error("unknown lint {0}")]
+    #[error("unknown lint `{0}`")]
     Unknown(String),
+
+    /// The name uses the full qualified diagnostic id `lint:<rule>` instead of just `rule`.
+    /// The String is the name without the `lint:` category prefix.
+    #[error("unknown lint `{prefixed}`. Did you mean `{suggestion}`?")]
+    PrefixedWithCategory {
+        prefixed: String,
+        suggestion: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -397,6 +441,16 @@ pub enum LintEntry {
     /// A lint rule that has been removed.
     Removed(LintId),
     Alias(LintId),
+}
+
+impl LintEntry {
+    fn id(self) -> LintId {
+        match self {
+            LintEntry::Lint(id) => id,
+            LintEntry::Removed(id) => id,
+            LintEntry::Alias(id) => id,
+        }
+    }
 }
 
 impl From<&'static LintMetadata> for LintEntry {
