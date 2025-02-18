@@ -11,7 +11,7 @@ mod tests {
     use test_case::test_case;
 
     use crate::registry::Rule;
-    use crate::settings::types::PythonVersion;
+    use crate::settings::types::{PreviewMode, PythonVersion};
     use crate::test::test_path;
     use crate::{assert_messages, settings};
 
@@ -50,11 +50,30 @@ mod tests {
     #[test_case(Rule::SortedMinMax, Path::new("FURB192.py"))]
     #[test_case(Rule::SliceToRemovePrefixOrSuffix, Path::new("FURB188.py"))]
     #[test_case(Rule::SubclassBuiltin, Path::new("FURB189.py"))]
+    #[test_case(Rule::FromisoformatReplaceZ, Path::new("FURB162.py"))]
     fn rules(rule_code: Rule, path: &Path) -> Result<()> {
         let snapshot = format!("{}_{}", rule_code.noqa_code(), path.to_string_lossy());
         let diagnostics = test_path(
             Path::new("refurb").join(path).as_path(),
             &settings::LinterSettings::for_rule(rule_code),
+        )?;
+        assert_messages!(snapshot, diagnostics);
+        Ok(())
+    }
+
+    #[test_case(Rule::TypeNoneComparison, Path::new("FURB169.py"))]
+    fn preview_rules(rule_code: Rule, path: &Path) -> Result<()> {
+        let snapshot = format!(
+            "preview__{}_{}",
+            rule_code.noqa_code(),
+            path.to_string_lossy()
+        );
+        let diagnostics = test_path(
+            Path::new("refurb").join(path).as_path(),
+            &settings::LinterSettings {
+                preview: PreviewMode::Enabled,
+                ..settings::LinterSettings::for_rule(rule_code)
+            },
         )?;
         assert_messages!(snapshot, diagnostics);
         Ok(())

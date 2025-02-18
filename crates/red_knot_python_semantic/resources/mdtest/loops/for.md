@@ -109,9 +109,9 @@ reveal_type(x)
 def _(flag: bool):
     class NotIterable:
         if flag:
-            __iter__ = 1
+            __iter__: int = 1
         else:
-            __iter__ = None
+            __iter__: None = None
 
     for x in NotIterable():  # error: "Object of type `NotIterable` is not iterable"
         pass
@@ -135,7 +135,7 @@ for x in nonsense:  # error: "Object of type `Literal[123]` is not iterable"
 class NotIterable:
     def __getitem__(self, key: int) -> int:
         return 42
-    __iter__ = None
+    __iter__: None = None
 
 for x in NotIterable():  # error: "Object of type `NotIterable` is not iterable"
     pass
@@ -245,9 +245,10 @@ class Test2:
         return 42
 
 def _(flag: bool):
+    # TODO: Improve error message to state which union variant isn't iterable (https://github.com/astral-sh/ruff/issues/13989)
     # error: "Object of type `Test | Test2` is not iterable"
     for x in Test() if flag else Test2():
-        reveal_type(x)  # revealed: Unknown
+        reveal_type(x)  # revealed: int
 ```
 
 ## Union type as iterator where one union element has no `__next__` method
@@ -263,5 +264,5 @@ class Test:
 
 # error: [not-iterable] "Object of type `Test` is not iterable"
 for x in Test():
-    reveal_type(x)  # revealed: Unknown
+    reveal_type(x)  # revealed: int
 ```

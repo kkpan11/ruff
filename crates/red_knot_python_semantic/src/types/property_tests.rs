@@ -27,9 +27,9 @@
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::db::tests::{setup_db, TestDb};
+use crate::symbol::{builtins_symbol, known_module_symbol};
 use crate::types::{
-    builtins_symbol, known_module_symbol, IntersectionBuilder, KnownClass, KnownInstanceType,
-    SubclassOfType, TupleType, Type, UnionType,
+    IntersectionBuilder, KnownClass, KnownInstanceType, SubclassOfType, TupleType, Type, UnionType,
 };
 use crate::KnownModule;
 use quickcheck::{Arbitrary, Gen};
@@ -329,7 +329,7 @@ fn union<'db>(db: &'db TestDb, tys: impl IntoIterator<Item = Type<'db>>) -> Type
 
 mod stable {
     use super::union;
-    use crate::types::{KnownClass, Type};
+    use crate::types::Type;
 
     // Reflexivity: `T` is equivalent to itself.
     type_property_test!(
@@ -419,13 +419,13 @@ mod stable {
     // All types should be assignable to `object`
     type_property_test!(
         all_types_assignable_to_object, db,
-        forall types t. t.is_assignable_to(db, KnownClass::Object.to_instance(db))
+        forall types t. t.is_assignable_to(db, Type::object(db))
     );
 
     // And for fully static types, they should also be subtypes of `object`
     type_property_test!(
         all_fully_static_types_subtype_of_object, db,
-        forall types t. t.is_fully_static(db) => t.is_subtype_of(db, KnownClass::Object.to_instance(db))
+        forall types t. t.is_fully_static(db) => t.is_subtype_of(db, Type::object(db))
     );
 
     // Never should be assignable to every type
@@ -466,6 +466,13 @@ mod stable {
     type_property_test!(
         assignable_to_is_reflexive, db,
         forall types t. t.is_assignable_to(db, t)
+    );
+
+    // For *any* pair of types, whether fully static or not,
+    // each of the pair should be assignable to the union of the two.
+    type_property_test!(
+        all_type_pairs_are_assignable_to_their_union, db,
+        forall types s, t. s.is_assignable_to(db, union(db, [s, t])) && t.is_assignable_to(db, union(db, [s, t]))
     );
 }
 
@@ -513,13 +520,6 @@ mod flaky {
     type_property_test!(
         all_type_pairs_can_be_assigned_from_their_intersection, db,
         forall types s, t. intersection(db, [s, t]).is_assignable_to(db, s) && intersection(db, [s, t]).is_assignable_to(db, t)
-    );
-
-    // For *any* pair of types, whether fully static or not,
-    // each of the pair should be assignable to the union of the two.
-    type_property_test!(
-        all_type_pairs_are_assignable_to_their_union, db,
-        forall types s, t. s.is_assignable_to(db, union(db, [s, t])) && t.is_assignable_to(db, union(db, [s, t]))
     );
 
     // Equal element sets of intersections implies equivalence

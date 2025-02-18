@@ -20,7 +20,7 @@ wrong_innards: MyBox[int] = MyBox("five")
 # TODO reveal int, do not leak the typevar
 reveal_type(box.data)  # revealed: T
 
-reveal_type(MyBox.box_model_number)  # revealed: Literal[695]
+reveal_type(MyBox.box_model_number)  # revealed: Unknown | Literal[695]
 ```
 
 ## Subclassing
@@ -51,7 +51,7 @@ In type stubs, classes can reference themselves in their base class definitions.
 
 This should hold true even with generics at play.
 
-```py path=a.pyi
+```pyi
 class Seq[T]: ...
 
 # TODO not error on the subscripting
