@@ -8,11 +8,11 @@ use super::{
 };
 use crate::semantic_index::DeclarationWithConstraint;
 use crate::semantic_index::definition::Definition;
-use crate::types::generics::{GenericContext, Specialization, TypeMapping};
+use crate::types::generics::{GenericContext, Specialization};
 use crate::types::signatures::{Parameter, Parameters};
 use crate::types::{
     CallableType, DataclassParams, DataclassTransformerParams, KnownInstanceType, Signature,
-    TypeVarInstance,
+    TypeMapping, TypeVarInstance,
 };
 use crate::{
     Db, FxOrderSet, KnownModule, Program,
@@ -157,7 +157,12 @@ impl CodeGeneratorKind {
 }
 
 /// A specialization of a generic class with a particular assignment of types to typevars.
+///
+/// # Ordering
+/// Ordering is based on the generic aliases's salsa-assigned id and not on its values.
+/// The id may change between runs, or when the alias was garbage collected and recreated.
 #[salsa::interned(debug)]
+#[derive(PartialOrd, Ord)]
 pub struct GenericAlias<'db> {
     pub(crate) origin: ClassLiteral<'db>,
     pub(crate) specialization: Specialization<'db>,
@@ -175,7 +180,7 @@ impl<'db> GenericAlias<'db> {
     pub(super) fn apply_type_mapping<'a>(
         self,
         db: &'db dyn Db,
-        type_mapping: TypeMapping<'a, 'db>,
+        type_mapping: &TypeMapping<'a, 'db>,
     ) -> Self {
         Self::new(
             db,
@@ -216,6 +221,10 @@ impl<'db> ClassType<'db> {
             Self::NonGeneric(_) => self,
             Self::Generic(generic) => Self::Generic(generic.normalized(db)),
         }
+    }
+
+    pub(super) const fn is_generic(self) -> bool {
+        matches!(self, Self::Generic(_))
     }
 
     /// Returns the class literal and specialization for this class. For a non-generic class, this
@@ -278,7 +287,7 @@ impl<'db> ClassType<'db> {
     pub(super) fn apply_type_mapping<'a>(
         self,
         db: &'db dyn Db,
-        type_mapping: TypeMapping<'a, 'db>,
+        type_mapping: &TypeMapping<'a, 'db>,
     ) -> Self {
         match self {
             Self::NonGeneric(_) => self,
@@ -347,7 +356,7 @@ impl<'db> ClassType<'db> {
                 ClassBase::Dynamic(_) => false,
 
                 // Protocol and Generic are not represented by a ClassType.
-                ClassBase::Protocol(_) | ClassBase::Generic(_) => false,
+                ClassBase::Protocol | ClassBase::Generic => false,
 
                 ClassBase::Class(base) => match (base, other) {
                     (ClassType::NonGeneric(base), ClassType::NonGeneric(other)) => base == other,
@@ -385,7 +394,7 @@ impl<'db> ClassType<'db> {
                 ClassBase::Dynamic(_) => false,
 
                 // Protocol and Generic are not represented by a ClassType.
-                ClassBase::Protocol(_) | ClassBase::Generic(_) => false,
+                ClassBase::Protocol | ClassBase::Generic => false,
 
                 ClassBase::Class(base) => match (base, other) {
                     (ClassType::NonGeneric(base), ClassType::NonGeneric(other)) => base == other,
@@ -503,7 +512,12 @@ impl<'db> From<ClassType<'db>> for Type<'db> {
 ///
 /// This does not in itself represent a type, but can be transformed into a [`ClassType`] that
 /// does. (For generic classes, this requires specializing its generic context.)
+///
+/// # Ordering
+/// Ordering is based on the class's id assigned by salsa and not on the class literal's values.
+/// The id may change between runs, or when the class literal was garbage collected and recreated.
 #[salsa::interned(debug)]
+#[derive(PartialOrd, Ord)]
 pub struct ClassLiteral<'db> {
     /// Name of the class at definition
     #[returns(ref)]
@@ -590,11 +604,6 @@ impl<'db> ClassLiteral<'db> {
                 .copied()
                 .filter(|ty| matches!(ty, Type::GenericAlias(_))),
         )
-    }
-
-    /// Return `true` if this class represents the builtin class `object`
-    pub(crate) fn is_object(self, db: &'db dyn Db) -> bool {
-        self.is_known(db, KnownClass::Object)
     }
 
     fn file(self, db: &dyn Db) -> File {
@@ -1058,7 +1067,7 @@ impl<'db> ClassLiteral<'db> {
 
         for superclass in mro_iter {
             match superclass {
-                ClassBase::Generic(_) | ClassBase::Protocol(_) => {
+                ClassBase::Generic | ClassBase::Protocol => {
                     // Skip over these very special class bases that aren't really classes.
                 }
                 ClassBase::Dynamic(_) => {
@@ -1417,7 +1426,7 @@ impl<'db> ClassLiteral<'db> {
 
         for superclass in self.iter_mro(db, specialization) {
             match superclass {
-                ClassBase::Generic(_) | ClassBase::Protocol(_) => {
+                ClassBase::Generic | ClassBase::Protocol => {
                     // Skip over these very special class bases that aren't really classes.
                 }
                 ClassBase::Dynamic(_) => {
@@ -1728,9 +1737,15 @@ impl<'db> ClassLiteral<'db> {
             let declared_and_qualifiers = symbol_from_declarations(db, declarations);
             match declared_and_qualifiers {
                 Ok(SymbolAndQualifiers {
-                    symbol: declared @ Symbol::Type(declared_ty, declaredness),
+                    symbol: mut declared @ Symbol::Type(declared_ty, declaredness),
                     qualifiers,
                 }) => {
+                    // For the purpose of finding instance attributes, ignore `ClassVar`
+                    // declarations:
+                    if qualifiers.contains(TypeQualifiers::CLASS_VAR) {
+                        declared = Symbol::Unbound;
+                    }
+
                     // The attribute is declared in the class body.
 
                     let bindings = use_def.public_bindings(symbol_id);
@@ -2877,6 +2892,7 @@ mod tests {
     use super::*;
     use crate::db::tests::setup_db;
     use crate::module_resolver::resolve_module;
+    use crate::{PythonVersionSource, PythonVersionWithSource};
     use salsa::Setter;
     use strum::IntoEnumIterator;
 
@@ -2888,7 +2904,7 @@ mod tests {
             let class_module = resolve_module(&db, &class.canonical_module(&db).name()).unwrap();
 
             assert_eq!(
-                KnownClass::try_from_file_and_name(&db, class_module.file(), class_name),
+                KnownClass::try_from_file_and_name(&db, class_module.file().unwrap(), class_name),
                 Some(class),
                 "`KnownClass::candidate_from_str` appears to be missing a case for `{class_name}`"
             );
@@ -2900,8 +2916,11 @@ mod tests {
         let mut db = setup_db();
 
         Program::get(&db)
-            .set_python_version(&mut db)
-            .to(PythonVersion::latest_ty());
+            .set_python_version_with_source(&mut db)
+            .to(PythonVersionWithSource {
+                version: PythonVersion::latest_ty(),
+                source: PythonVersionSource::default(),
+            });
 
         for class in KnownClass::iter() {
             assert_ne!(
@@ -2925,8 +2944,11 @@ mod tests {
             };
 
             Program::get(&db)
-                .set_python_version(&mut db)
-                .to(version_added);
+                .set_python_version_with_source(&mut db)
+                .to(PythonVersionWithSource {
+                    version: version_added,
+                    source: PythonVersionSource::default(),
+                });
 
             assert_ne!(
                 class.to_instance(&db),
